@@ -24,6 +24,8 @@ use openinfer_core::kv_pool::KvState;
 use openinfer_core::tensor::DeviceVec;
 use openinfer_core::tensor::HiddenStates;
 
+use super::flashinfer_gdn::FlashInferGdnChunkResources;
+use super::flashinfer_gdn::GdnPrefillBackendSeam;
 use super::prefill_buffers::GdrChunkwiseScratch35;
 use super::recurrent_state::RecurrentState;
 use super::weights::FullAttentionLayer;
@@ -34,6 +36,48 @@ use super::weights::TransformerBlock35;
 use crate::ffi;
 use crate::ops;
 use crate::ops::PrefillPagedPlan;
+
+enum GdnPrefillChunkScratch {
+    Triton(Box<GdrChunkwiseScratch35>),
+    FlashInfer(Box<FlashInferGdnChunkResources>),
+}
+
+/// Opaque request state for the explicit GDN prefill test/benchmark seam.
+///
+/// Each backend being compared must own a different instance. That guarantees
+/// identical starting state without accidentally letting the first run mutate
+/// the second run's recurrent or paged-KV storage.
+pub struct GdnPrefillBenchmarkState {
+    kv: KvState,
+    recurrent: RecurrentState,
+}
+
+/// Host-observable result from executing the same fresh request through the
+/// Triton baseline and the explicitly selected FlashInfer candidate.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GdnPrefillComparison {
+    pub tokens: usize,
+    pub hidden_max_abs: f32,
+    pub recurrent_state_max_abs: f32,
+    pub conv_state_max_abs: f32,
+}
+
+fn update_max_abs(max_abs: &mut f32, left: &[f32], right: &[f32]) -> Result<()> {
+    anyhow::ensure!(
+        left.len() == right.len(),
+        "GDN comparison length mismatch: Triton={}, FlashInfer={}",
+        left.len(),
+        right.len()
+    );
+    for (index, (&baseline, &candidate)) in left.iter().zip(right).enumerate() {
+        anyhow::ensure!(
+            baseline.is_finite() && candidate.is_finite(),
+            "GDN comparison found non-finite value at index {index}: Triton={baseline}, FlashInfer={candidate}"
+        );
+        *max_abs = (*max_abs).max((baseline - candidate).abs());
+    }
+    Ok(())
+}
 
 fn checked_prefill_end_pos(
     base_pos: usize,
@@ -51,6 +95,121 @@ fn checked_prefill_end_pos(
 }
 
 impl Qwen35Model {
+    /// Load the pinned FlashInfer artifact for the explicit runtime
+    /// test/benchmark seam. This does not change production dispatch, which
+    /// remains hard-wired to Triton in `prefill_chunk_forward`.
+    pub fn install_flashinfer_gdn_for_benchmark(
+        &mut self,
+        manifest_path: &std::path::Path,
+    ) -> Result<()> {
+        self.install_flashinfer_gdn(manifest_path)
+    }
+
+    /// Allocate an empty request state for one side of a GDN benchmark.
+    pub fn new_gdn_prefill_benchmark_state(&self) -> Result<GdnPrefillBenchmarkState> {
+        Ok(GdnPrefillBenchmarkState {
+            kv: self.alloc_kv(),
+            recurrent: RecurrentState::new(&self.ctx, &self.config)?,
+        })
+    }
+
+    fn run_gdn_prefill_benchmark_chunk(
+        &self,
+        token_ids: &[u32],
+        state: &mut GdnPrefillBenchmarkState,
+        backend: GdnPrefillBackendSeam,
+    ) -> Result<HiddenStates> {
+        anyhow::ensure!(
+            !token_ids.is_empty() && token_ids.len() <= PREFILL_CHUNK_LEN,
+            "GDN benchmark chunk length {} is outside 1..={PREFILL_CHUNK_LEN}",
+            token_ids.len()
+        );
+        self.prefill_chunk_forward_with_gdn_backend(
+            token_ids,
+            &mut state.kv,
+            &mut state.recurrent,
+            backend,
+        )
+    }
+
+    /// Execute one benchmark chunk through the production Triton baseline.
+    /// This backend-named method avoids exposing a public backend enum.
+    pub fn run_triton_gdn_prefill_benchmark_chunk(
+        &self,
+        token_ids: &[u32],
+        state: &mut GdnPrefillBenchmarkState,
+    ) -> Result<HiddenStates> {
+        self.run_gdn_prefill_benchmark_chunk(token_ids, state, GdnPrefillBackendSeam::Triton)
+    }
+
+    /// Execute one benchmark chunk through the quarantined FlashInfer
+    /// candidate. Failure is returned directly and never falls back to Triton.
+    pub fn run_flashinfer_gdn_prefill_benchmark_chunk(
+        &self,
+        token_ids: &[u32],
+        state: &mut GdnPrefillBenchmarkState,
+    ) -> Result<HiddenStates> {
+        self.run_gdn_prefill_benchmark_chunk(token_ids, state, GdnPrefillBackendSeam::FlashInfer)
+    }
+
+    /// Run the same fresh request through Triton and FlashInfer and compare the
+    /// full chunk output plus every linear layer's recurrent and conv state.
+    /// The backend identities are explicit at both calls, so an unavailable
+    /// FlashInfer artifact is reported rather than falling back.
+    pub fn compare_gdn_prefill_backends(&self, token_ids: &[u32]) -> Result<GdnPrefillComparison> {
+        let mut triton_state = self.new_gdn_prefill_benchmark_state()?;
+        let mut flashinfer_state = self.new_gdn_prefill_benchmark_state()?;
+        let triton_output =
+            self.run_triton_gdn_prefill_benchmark_chunk(token_ids, &mut triton_state)?;
+        let flashinfer_output =
+            self.run_flashinfer_gdn_prefill_benchmark_chunk(token_ids, &mut flashinfer_state)?;
+
+        anyhow::ensure!(
+            triton_state.recurrent.seq_len == flashinfer_state.recurrent.seq_len,
+            "GDN comparison recurrent sequence lengths differ: Triton={}, FlashInfer={}",
+            triton_state.recurrent.seq_len,
+            flashinfer_state.recurrent.seq_len
+        );
+        anyhow::ensure!(
+            triton_state.recurrent.layers.len() == flashinfer_state.recurrent.layers.len(),
+            "GDN comparison recurrent layer counts differ"
+        );
+
+        let triton_hidden = triton_output.to_host(&self.ctx)?;
+        let flashinfer_hidden = flashinfer_output.to_host(&self.ctx)?;
+        let mut hidden_max_abs = 0.0;
+        update_max_abs(&mut hidden_max_abs, &triton_hidden, &flashinfer_hidden)?;
+
+        let mut recurrent_state_max_abs = 0.0;
+        let mut conv_state_max_abs = 0.0;
+        for (triton_layer, flashinfer_layer) in triton_state
+            .recurrent
+            .layers
+            .iter()
+            .zip(&flashinfer_state.recurrent.layers)
+        {
+            let triton_recurrent = self.ctx.stream.clone_dtoh(&triton_layer.state)?;
+            let flashinfer_recurrent = self.ctx.stream.clone_dtoh(&flashinfer_layer.state)?;
+            self.ctx.sync()?;
+            update_max_abs(
+                &mut recurrent_state_max_abs,
+                &triton_recurrent,
+                &flashinfer_recurrent,
+            )?;
+
+            let triton_conv = triton_layer.conv_state.to_host(&self.ctx)?;
+            let flashinfer_conv = flashinfer_layer.conv_state.to_host(&self.ctx)?;
+            update_max_abs(&mut conv_state_max_abs, &triton_conv, &flashinfer_conv)?;
+        }
+
+        Ok(GdnPrefillComparison {
+            tokens: token_ids.len(),
+            hidden_max_abs,
+            recurrent_state_max_abs,
+            conv_state_max_abs,
+        })
+    }
+
     pub(super) fn prefill_last_hidden(
         &self,
         token_ids: &[u32],
@@ -141,8 +300,26 @@ impl Qwen35Model {
         kv_state: &mut KvState,
         recurrent: &mut RecurrentState,
     ) -> Result<HiddenStates> {
+        self.prefill_chunk_forward_with_gdn_backend(
+            token_ids,
+            kv_state,
+            recurrent,
+            GdnPrefillBackendSeam::Triton,
+        )
+    }
+
+    /// Crate-private Stage 6 seam for model-internal tests/benchmarks. The
+    /// production entry above always selects Triton; requesting FlashInfer is
+    /// explicit and fails if no validated model-local artifact is installed.
+    pub(crate) fn prefill_chunk_forward_with_gdn_backend(
+        &self,
+        token_ids: &[u32],
+        kv_state: &mut KvState,
+        recurrent: &mut RecurrentState,
+        gdn_backend: GdnPrefillBackendSeam,
+    ) -> Result<HiddenStates> {
         let seq_len = token_ids.len();
-        debug_assert!(
+        anyhow::ensure!(
             seq_len > 0 && seq_len <= PREFILL_CHUNK_LEN,
             "prefill chunk length {seq_len} out of range 1..={PREFILL_CHUNK_LEN}"
         );
@@ -170,7 +347,20 @@ impl Qwen35Model {
         // Allocate the chunk scratch before advancing the KV state. It is the
         // largest, most allocation-prone buffer here, so failing first leaves
         // `kv_state` untouched and the request can be rejected cleanly.
-        let mut gdr_chunkwise_scratch = GdrChunkwiseScratch35::new(&self.ctx, c, seq_len)?;
+        let mut gdn_scratch = match gdn_backend {
+            GdnPrefillBackendSeam::Triton => GdnPrefillChunkScratch::Triton(Box::new(
+                GdrChunkwiseScratch35::new(&self.ctx, c, seq_len)?,
+            )),
+            GdnPrefillBackendSeam::FlashInfer => {
+                let backend = self.flashinfer_gdn()?;
+                GdnPrefillChunkScratch::FlashInfer(Box::new(FlashInferGdnChunkResources::new(
+                    &self.ctx,
+                    &self.config,
+                    backend,
+                    seq_len,
+                )?))
+            }
+        };
 
         // Advance paged KV state and build this chunk's prefill plan.
         kv_state.ensure_capacity(end_pos)?;
@@ -196,13 +386,17 @@ impl Qwen35Model {
                 layer_idx,
                 layer,
                 &hidden_batch,
-                &mut gdr_chunkwise_scratch,
+                &mut gdn_scratch,
                 &mut linear_idx,
                 &mut full_idx,
                 kv_state,
                 &prefill_plan,
                 recurrent,
             )?;
+        }
+
+        if let GdnPrefillChunkScratch::FlashInfer(resources) = &gdn_scratch {
+            resources.ensure_prepare_inputs_finite(&self.ctx)?;
         }
 
         // Advance recurrent token count for the next chunk / decode step; the
@@ -219,7 +413,7 @@ impl Qwen35Model {
         _layer_idx: usize,
         layer: &TransformerBlock35,
         hidden_batch: &HiddenStates,
-        gdr_chunkwise_scratch: &mut GdrChunkwiseScratch35,
+        gdn_scratch: &mut GdnPrefillChunkScratch,
         linear_idx: &mut usize,
         full_idx: &mut usize,
         kv_state: &KvState,
@@ -259,7 +453,7 @@ impl Qwen35Model {
                 &normed_batch,
                 linear_idx,
                 recurrent,
-                gdr_chunkwise_scratch,
+                gdn_scratch,
                 seq_len,
             )?,
         };
@@ -441,7 +635,7 @@ impl Qwen35Model {
         normed_batch: &HiddenStates,
         linear_idx: &mut usize,
         recurrent: &mut RecurrentState,
-        gdr_chunkwise_scratch: &mut GdrChunkwiseScratch35,
+        gdn_scratch: &mut GdnPrefillChunkScratch,
         seq_len: usize,
     ) -> Result<HiddenStates> {
         let c = &self.config;
@@ -466,34 +660,67 @@ impl Qwen35Model {
             c.linear_conv_kernel_dim,
         );
 
-        let mut gdr_out_batch = HiddenStates::zeros(&self.ctx, z_dim, seq_len)?;
-        ops::gated_delta_rule_prefill_chunkwise_into(
-            &self.ctx,
-            &qkv_conv_batch,
-            &b_batch,
-            &a_batch,
-            &attn.dt_bias,
-            &attn.a_log,
-            &mut layer_state.state,
-            gdr_chunkwise_scratch,
-            &mut gdr_out_batch,
-            c.linear_num_key_heads,
-            c.linear_num_value_heads,
-            c.linear_key_head_dim,
-            c.linear_value_head_dim,
-        )?;
-
         let mut normed_out_batch = HiddenStates::zeros(&self.ctx, z_dim, seq_len)?;
-        ops::rms_norm_gated_batch_into(
-            &self.ctx,
-            &gdr_out_batch,
-            &attn.norm_weight,
-            &z_batch,
-            &mut normed_out_batch,
-            c.linear_num_value_heads,
-            c.linear_value_head_dim,
-            c.rms_norm_eps,
-        );
+        match gdn_scratch {
+            GdnPrefillChunkScratch::Triton(scratch) => {
+                let mut gdr_out_batch = HiddenStates::zeros(&self.ctx, z_dim, seq_len)?;
+                ops::gated_delta_rule_prefill_chunkwise_into(
+                    &self.ctx,
+                    &qkv_conv_batch,
+                    &b_batch,
+                    &a_batch,
+                    &attn.dt_bias,
+                    &attn.a_log,
+                    &mut layer_state.state,
+                    scratch,
+                    &mut gdr_out_batch,
+                    c.linear_num_key_heads,
+                    c.linear_num_value_heads,
+                    c.linear_key_head_dim,
+                    c.linear_value_head_dim,
+                )?;
+                ops::rms_norm_gated_batch_into(
+                    &self.ctx,
+                    &gdr_out_batch,
+                    &attn.norm_weight,
+                    &z_batch,
+                    &mut normed_out_batch,
+                    c.linear_num_value_heads,
+                    c.linear_value_head_dim,
+                    c.rms_norm_eps,
+                );
+            }
+            GdnPrefillChunkScratch::FlashInfer(resources) => {
+                ops::gated_delta_rule_prefill_native_prepare_into(
+                    &self.ctx,
+                    &qkv_conv_batch,
+                    &b_batch,
+                    &a_batch,
+                    &attn.dt_bias,
+                    &attn.a_log,
+                    &mut resources.prepare,
+                    c.linear_num_key_heads,
+                    c.linear_num_key_heads,
+                    c.linear_num_value_heads,
+                    c.linear_key_head_dim,
+                )?;
+                resources.launch_in_place(
+                    &self.ctx,
+                    self.flashinfer_gdn()?,
+                    &mut layer_state.state,
+                )?;
+                ops::rms_norm_gated_batch_into(
+                    &self.ctx,
+                    &resources.output,
+                    &attn.norm_weight,
+                    &z_batch,
+                    &mut normed_out_batch,
+                    c.linear_num_value_heads,
+                    c.linear_value_head_dim,
+                    c.rms_norm_eps,
+                );
+            }
+        }
 
         *linear_idx += 1;
 
@@ -516,6 +743,7 @@ impl Qwen35Model {
 #[cfg(test)]
 mod tests {
     use super::checked_prefill_end_pos;
+    use super::update_max_abs;
 
     #[test]
     fn checked_prefill_end_pos_accepts_config_limit() {
@@ -544,5 +772,20 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("prefill position overflow"));
+    }
+
+    #[test]
+    fn gdn_comparison_tracks_max_abs_across_multiple_tensors() {
+        let mut max_abs = 0.0;
+        update_max_abs(&mut max_abs, &[1.0, -2.0], &[1.25, -2.1]).unwrap();
+        update_max_abs(&mut max_abs, &[4.0], &[3.5]).unwrap();
+        assert_eq!(max_abs, 0.5);
+    }
+
+    #[test]
+    fn gdn_comparison_rejects_length_and_non_finite_values() {
+        let mut max_abs = 0.0;
+        assert!(update_max_abs(&mut max_abs, &[1.0], &[1.0, 2.0]).is_err());
+        assert!(update_max_abs(&mut max_abs, &[f32::NAN], &[0.0]).is_err());
     }
 }

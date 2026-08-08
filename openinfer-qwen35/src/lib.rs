@@ -10,6 +10,13 @@ pub(crate) mod config;
 mod decode_buffers;
 mod executor;
 mod ffi;
+mod flashinfer_gdn;
+#[cfg(test)]
+mod gdn_prefill_test_contract;
+#[cfg(test)]
+mod gdn_prepare_test_contract;
+#[cfg(test)]
+mod gdn_stage6_test_contract;
 mod logprobs;
 mod ops;
 mod prefill;
@@ -49,6 +56,8 @@ pub mod runtime {
     pub use crate::executor::PrefillStepItem;
     pub use crate::executor::Qwen35Executor;
     pub use crate::executor::RequestId;
+    pub use crate::prefill::GdnPrefillBenchmarkState;
+    pub use crate::prefill::GdnPrefillComparison;
     pub use crate::scheduler::start_with_capacity;
     pub use crate::tp_executor::Qwen35TpExecutor;
     pub use crate::weights::Qwen35Model;

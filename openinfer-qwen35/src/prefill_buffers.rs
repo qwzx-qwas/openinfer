@@ -8,6 +8,80 @@ use openinfer_core::tensor::HiddenStates;
 
 use super::config::Config35;
 
+/// Outputs of the native, non-expanded GDN prepare kernel.
+///
+/// This buffer is intentionally separate from `GdrChunkwiseScratch35`: the
+/// production Triton path below still requires value-head-expanded Q/K, while
+/// the FlashInfer candidate consumes native Hq/Hk tensors directly.
+#[allow(dead_code)]
+pub(crate) struct GdnPrepareScratch35 {
+    /// Normalized native Q, bf16 token-major `[T,Hq,D]`.
+    pub(crate) q: HiddenStates,
+    /// Normalized native K, bf16 token-major `[T,Hk,D]`.
+    pub(crate) k: HiddenStates,
+    /// Raw V, bf16 token-major `[T,Hv,D]`.
+    pub(crate) v: HiddenStates,
+    /// Per-token decay multiplier, fp32 `[T,Hv]` (not log/cumulative alpha).
+    pub(crate) alpha: CudaSlice<f32>,
+    /// Per-token beta, fp32 `[T,Hv]`.
+    pub(crate) beta: CudaSlice<f32>,
+    /// Async validation result: zero means all consumed inputs were finite.
+    pub(crate) non_finite_status: CudaSlice<u32>,
+}
+
+#[allow(dead_code)]
+impl GdnPrepareScratch35 {
+    pub(crate) fn new(ctx: &DeviceContext, config: &Config35, seq_len: usize) -> Result<Self> {
+        Self::from_dims(
+            ctx,
+            config.linear_num_key_heads,
+            config.linear_num_key_heads,
+            config.linear_num_value_heads,
+            config.linear_key_head_dim,
+            seq_len,
+        )
+    }
+
+    pub(crate) fn from_dims(
+        ctx: &DeviceContext,
+        h_q: usize,
+        h_k: usize,
+        h_v: usize,
+        head_dim: usize,
+        seq_len: usize,
+    ) -> Result<Self> {
+        anyhow::ensure!(h_q == 16, "native GDN prepare requires Hq=16, got {h_q}");
+        anyhow::ensure!(h_k == 16, "native GDN prepare requires Hk=16, got {h_k}");
+        anyhow::ensure!(
+            matches!(h_v, 32 | 48),
+            "native GDN prepare requires Hv=32 or 48, got {h_v}"
+        );
+        anyhow::ensure!(
+            head_dim == 128,
+            "native GDN prepare requires D=128, got {head_dim}"
+        );
+        anyhow::ensure!(seq_len > 0, "native GDN prepare requires T>=1");
+
+        Ok(Self {
+            q: HiddenStates::zeros(ctx, h_q * head_dim, seq_len)?,
+            k: HiddenStates::zeros(ctx, h_k * head_dim, seq_len)?,
+            v: HiddenStates::zeros(ctx, h_v * head_dim, seq_len)?,
+            alpha: ctx
+                .stream
+                .alloc_zeros(seq_len * h_v)
+                .map_err(|e| anyhow::anyhow!("Alloc native GDN alpha failed: {e}"))?,
+            beta: ctx
+                .stream
+                .alloc_zeros(seq_len * h_v)
+                .map_err(|e| anyhow::anyhow!("Alloc native GDN beta failed: {e}"))?,
+            non_finite_status: ctx
+                .stream
+                .alloc_zeros(1)
+                .map_err(|e| anyhow::anyhow!("Alloc native GDN status failed: {e}"))?,
+        })
+    }
+}
+
 /// Scratch buffers for a single Qwen3.5 linear-attention chunk-wise GDR prefill call.
 ///
 /// The first implementation target is intentionally narrow:
