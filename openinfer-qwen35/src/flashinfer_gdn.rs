@@ -770,6 +770,7 @@ fn load_and_validate_artifact(manifest_path: &Path) -> Result<(ValidatedArtifact
         manifest.abi.entry_symbol
     );
     validate_ptx_launch_abi(&ptx)?;
+    let ptx = normalize_ptx_for_driver(ptx)?;
 
     Ok((
         ValidatedArtifact {
@@ -783,6 +784,27 @@ fn load_and_validate_artifact(manifest_path: &Path) -> Result<(ValidatedArtifact
         },
         ptx,
     ))
+}
+
+/// Normalize the verified PTX text before cudarc wraps it in a `CString`.
+///
+/// The frozen CUTLASS DSL artifact carries one C-string terminator followed by
+/// a newline.  Those bytes remain part of the pinned file size and SHA-256,
+/// but `Ptx::from_src` rejects the terminator as an interior NUL.  Permit that
+/// exact trailing representation while continuing to fail closed for a NUL
+/// followed by any non-whitespace PTX content or by another NUL.
+fn normalize_ptx_for_driver(mut ptx: String) -> Result<String> {
+    let Some(terminator) = ptx.find('\0') else {
+        return Ok(ptx);
+    };
+    ensure!(
+        ptx.as_bytes()[terminator + 1..]
+            .iter()
+            .all(u8::is_ascii_whitespace),
+        "GDN PTX contains an interior NUL at byte {terminator}"
+    );
+    ptx.truncate(terminator);
+    Ok(ptx)
 }
 
 fn validate_manifest(m: &Manifest) -> Result<()> {
@@ -1524,7 +1546,29 @@ mod tests {
         };
         let (artifact, ptx) = load_and_validate_artifact(Path::new(&path)).unwrap();
         assert_eq!(artifact.geometry.h_v, 32);
-        assert_eq!(ptx.len(), 549_690);
+        assert!(!ptx.contains('\0'));
+        assert!(ptx.ends_with("}\n"));
+    }
+
+    #[test]
+    fn strips_verified_ptx_trailing_c_string_terminator() {
+        assert_eq!(
+            normalize_ptx_for_driver(".version 8.8\n.entry kernel() {\n}\n\0\n".to_owned())
+                .unwrap(),
+            ".version 8.8\n.entry kernel() {\n}\n"
+        );
+        assert_eq!(
+            normalize_ptx_for_driver(".version 8.8\n".to_owned()).unwrap(),
+            ".version 8.8\n"
+        );
+    }
+
+    #[test]
+    fn rejects_ptx_interior_or_repeated_nul() {
+        assert!(
+            normalize_ptx_for_driver(".version 8.8\n\0.entry kernel() {}\n".to_owned()).is_err()
+        );
+        assert!(normalize_ptx_for_driver(".version 8.8\n\0\0\n".to_owned()).is_err());
     }
 
     #[test]
