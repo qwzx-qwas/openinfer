@@ -630,6 +630,14 @@ impl TmaSwizzle {
     }
 }
 
+fn tma_global_layout(tokens: u32, heads: u32) -> ([u64; 3], [u64; 2]) {
+    let element_bytes = std::mem::size_of::<half::bf16>() as u64;
+    (
+        [128, u64::from(tokens), u64::from(heads)],
+        [u64::from(heads) * 128 * element_bytes, 128 * element_bytes],
+    )
+}
+
 fn encode_tma_descriptor(
     pointer: u64,
     tokens: u32,
@@ -649,15 +657,12 @@ fn encode_tma_descriptor(
         "TMA tensor extents must be non-zero"
     );
 
-    // CUDA tensor-map dimensions are ordered fastest-to-slowest. The physical
-    // storage for all four views is token-major `[T,H,D]`, hence `[D,H,T]`
-    // here. This is the zero-copy realization of the manifest's Q `[T,D,H]`
-    // and K/V/O `[D,T,H]` views.
-    let global_dimensions = [128_u64, u64::from(heads), u64::from(tokens)];
-    let global_strides = [
-        128_u64 * std::mem::size_of::<half::bf16>() as u64,
-        u64::from(heads) * 128 * std::mem::size_of::<half::bf16>() as u64,
-    ];
+    // The compiled CuTe TMA tensor emits coordinates as `[D,T,H]` (the PTX
+    // operands are `{d, token, head}`). Preserve that logical axis order in
+    // the descriptor while describing the token-major `[T,H,D]` allocation.
+    // Sorting the axes by physical stride would silently turn head>0 into a
+    // token coordinate and make those accesses OOB when T is small.
+    let (global_dimensions, global_strides) = tma_global_layout(tokens, heads);
     // CuTe's K_SW128 atom covers D=128 with two 64-BF16 TMA operations;
     // MN_SW32 covers it with eight 16-BF16 operations.  `boxDim[0]` is the
     // inner dimension of one operation, not the full logical head dimension.
@@ -1545,6 +1550,17 @@ mod tests {
         assert_eq!(TmaSwizzle::B32.inner_box_elements() * bf16_bytes, 32);
         assert_eq!(128 % TmaSwizzle::B128.inner_box_elements(), 0);
         assert_eq!(128 % TmaSwizzle::B32.inner_box_elements(), 0);
+    }
+
+    #[test]
+    fn tma_global_layout_preserves_compiled_d_t_h_coordinates() {
+        let (dimensions, strides) = tma_global_layout(1, 32);
+        assert_eq!(dimensions, [128, 1, 32]);
+        assert_eq!(strides, [32 * 128 * 2, 128 * 2]);
+
+        let (dimensions, strides) = tma_global_layout(65, 48);
+        assert_eq!(dimensions, [128, 65, 48]);
+        assert_eq!(strides, [48 * 128 * 2, 128 * 2]);
     }
 
     #[test]
