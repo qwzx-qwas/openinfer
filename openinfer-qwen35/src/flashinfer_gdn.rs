@@ -582,7 +582,17 @@ impl FlashInferGdnChunkResources {
         final_state: u64,
         state_mode: FlashInferStateMode,
     ) -> Result<()> {
-        let args = FlashInferGdnPrefillArgs {
+        let args = self.args_for_state_pointers(ctx, initial_state, final_state);
+        backend.launch(ctx, &args, &self.tensor_maps, state_mode)
+    }
+
+    fn args_for_state_pointers(
+        &mut self,
+        ctx: &DeviceContext,
+        initial_state: u64,
+        final_state: u64,
+    ) -> FlashInferGdnPrefillArgs {
+        FlashInferGdnPrefillArgs {
             q: device_pointer(&ctx.stream, &self.prepare.q.data),
             k: device_pointer(&ctx.stream, &self.prepare.k.data),
             v: device_pointer(&ctx.stream, &self.prepare.v.data),
@@ -601,8 +611,7 @@ impl FlashInferGdnChunkResources {
             h_v: self.geometry.h_v,
             head_dim: self.geometry.head_dim,
             stream: ctx.stream.cu_stream(),
-        };
-        backend.launch(ctx, &args, &self.tensor_maps, state_mode)
+        }
     }
 }
 
@@ -1126,6 +1135,22 @@ mod tests {
 
     use super::*;
     use crate::config::LayerType;
+    use crate::gdn_prepare_test_contract::Fixture;
+    use crate::gdn_prepare_test_contract::Prepared;
+    use crate::gdn_prepare_test_contract::bf16_to_f32;
+    use crate::gdn_prepare_test_contract::deterministic_fixture;
+    use crate::gdn_prepare_test_contract::prepare;
+    use crate::gdn_stage7_test_support::CpuRunResult;
+    use crate::gdn_stage7_test_support::DifferenceStats;
+    use crate::gdn_stage7_test_support::PREPARE_GATE_TOLERANCE;
+    use crate::gdn_stage7_test_support::PREPARE_QK_TOLERANCE;
+    use crate::gdn_stage7_test_support::RECURRENCE_OUTPUT_TOLERANCE;
+    use crate::gdn_stage7_test_support::RECURRENCE_STATE_TOLERANCE;
+    use crate::gdn_stage7_test_support::asymmetric_hkv_state;
+    use crate::gdn_stage7_test_support::cpu_decode_from_raw;
+    use crate::gdn_stage7_test_support::cpu_stepwise;
+    use crate::gdn_stage7_test_support::transpose_kv_as_wrong_hvk;
+    use crate::prefill_buffers::GdrChunkwiseScratch35;
 
     fn candidate_config(h_v: usize) -> Config35 {
         Config35 {
@@ -1150,6 +1175,265 @@ mod tests {
             tie_word_embeddings: true,
             layer_types: vec![LayerType::LinearAttention; 32],
         }
+    }
+
+    struct DeviceFixture {
+        qkv: HiddenStates,
+        b: HiddenStates,
+        a: HiddenStates,
+        dt_bias: DeviceVec,
+        a_log: CudaSlice<f32>,
+    }
+
+    fn bf16_from_bits(values: &[u16]) -> Vec<bf16> {
+        values.iter().copied().map(bf16::from_bits).collect()
+    }
+
+    fn f32_from_bits(values: &[u16]) -> Vec<f32> {
+        values.iter().copied().map(bf16_to_f32).collect()
+    }
+
+    fn upload_fixture(ctx: &DeviceContext, fixture: &Fixture) -> Result<DeviceFixture> {
+        Ok(DeviceFixture {
+            qkv: HiddenStates::from_host(
+                ctx,
+                &bf16_from_bits(&fixture.qkv),
+                fixture.offsets.total,
+                fixture.geometry.tokens,
+            )?,
+            b: HiddenStates::from_host(
+                ctx,
+                &bf16_from_bits(&fixture.b),
+                fixture.geometry.h_v,
+                fixture.geometry.tokens,
+            )?,
+            a: HiddenStates::from_host(
+                ctx,
+                &bf16_from_bits(&fixture.a),
+                fixture.geometry.h_v,
+                fixture.geometry.tokens,
+            )?,
+            dt_bias: DeviceVec::from_host(ctx, &bf16_from_bits(&fixture.dt_bias))?,
+            a_log: ctx.stream.clone_htod(&fixture.a_log)?,
+        })
+    }
+
+    fn log_and_gate(
+        label: &str,
+        reference: &[f32],
+        candidate: &[f32],
+        tolerance: crate::gdn_stage7_test_support::NumericTolerance,
+    ) -> Result<DifferenceStats> {
+        let stats = DifferenceStats::compare(reference, candidate, tolerance)
+            .map_err(anyhow::Error::msg)?;
+        eprintln!("{label}: {stats:?}");
+        stats.ensure_within(label).map_err(anyhow::Error::msg)?;
+        Ok(stats)
+    }
+
+    fn validate_gpu_prepare(
+        ctx: &DeviceContext,
+        resources: &FlashInferGdnChunkResources,
+        expected: &Prepared,
+        tokens: usize,
+        h_v: usize,
+    ) -> Result<()> {
+        resources.ensure_prepare_inputs_finite(ctx)?;
+        let q = ctx.stream.clone_dtoh(&resources.prepare.q.data)?;
+        let k = ctx.stream.clone_dtoh(&resources.prepare.k.data)?;
+        let v = ctx.stream.clone_dtoh(&resources.prepare.v.data)?;
+        let alpha = ctx.stream.clone_dtoh(&resources.prepare.alpha)?;
+        let beta = ctx.stream.clone_dtoh(&resources.prepare.beta)?;
+        ctx.sync()?;
+
+        let q: Vec<f32> = q.iter().map(|value| value.to_f32()).collect();
+        let k: Vec<f32> = k.iter().map(|value| value.to_f32()).collect();
+        log_and_gate(
+            &format!("prepare.q Hv={h_v} T={tokens}"),
+            &f32_from_bits(&expected.q),
+            &q,
+            PREPARE_QK_TOLERANCE,
+        )?;
+        log_and_gate(
+            &format!("prepare.k Hv={h_v} T={tokens}"),
+            &f32_from_bits(&expected.k),
+            &k,
+            PREPARE_QK_TOLERANCE,
+        )?;
+        ensure!(
+            v.iter()
+                .map(|value| value.to_bits())
+                .eq(expected.v.iter().copied()),
+            "prepare.v must preserve BF16 bits exactly at Hv={h_v}, T={tokens}"
+        );
+        log_and_gate(
+            &format!("prepare.alpha Hv={h_v} T={tokens}"),
+            &expected.alpha,
+            &alpha,
+            PREPARE_GATE_TOLERANCE,
+        )?;
+        log_and_gate(
+            &format!("prepare.beta Hv={h_v} T={tokens}"),
+            &expected.beta,
+            &beta,
+            PREPARE_GATE_TOLERANCE,
+        )?;
+        Ok(())
+    }
+
+    fn run_batched_decode_handoff(
+        ctx: &DeviceContext,
+        h_v: usize,
+        cpu_prefill: &CpuRunResult,
+        triton_state: &mut CudaSlice<f32>,
+        flashinfer_state: &mut CudaSlice<f32>,
+        tokens: usize,
+    ) -> Result<()> {
+        let decode_fixture = deterministic_fixture(1, h_v);
+        let cpu_decode = cpu_decode_from_raw(&decode_fixture, &cpu_prefill.final_state)
+            .map_err(anyhow::Error::msg)?;
+
+        let repeat_twice = |values: &[u16]| {
+            values
+                .iter()
+                .chain(values.iter())
+                .copied()
+                .collect::<Vec<_>>()
+        };
+        let qkv = HiddenStates::from_host(
+            ctx,
+            &bf16_from_bits(&repeat_twice(&decode_fixture.qkv)),
+            decode_fixture.offsets.total,
+            2,
+        )?;
+        let b = HiddenStates::from_host(
+            ctx,
+            &bf16_from_bits(&repeat_twice(&decode_fixture.b)),
+            h_v,
+            2,
+        )?;
+        let a = HiddenStates::from_host(
+            ctx,
+            &bf16_from_bits(&repeat_twice(&decode_fixture.a)),
+            h_v,
+            2,
+        )?;
+        let dt_bias = DeviceVec::from_host(ctx, &bf16_from_bits(&decode_fixture.dt_bias))?;
+        let a_log = ctx.stream.clone_htod(&decode_fixture.a_log)?;
+
+        let state_ptrs = {
+            let (triton_pointer, _triton_guard) = triton_state.device_ptr_mut(&ctx.stream);
+            let (flashinfer_pointer, _flashinfer_guard) =
+                flashinfer_state.device_ptr_mut(&ctx.stream);
+            ctx.stream
+                .clone_htod(&[triton_pointer, flashinfer_pointer])?
+        };
+        let mut output = HiddenStates::zeros(ctx, h_v * decode_fixture.geometry.d, 2)?;
+        crate::ops::gated_delta_rule_decode_batch_into(
+            ctx,
+            &qkv,
+            &b,
+            &a,
+            &dt_bias,
+            &a_log,
+            &state_ptrs,
+            &mut output,
+            2,
+            decode_fixture.geometry.h_k,
+            h_v,
+            decode_fixture.geometry.d,
+            decode_fixture.geometry.d,
+        );
+
+        let output = output.to_host(ctx)?;
+        let triton_after_decode = ctx.stream.clone_dtoh(triton_state)?;
+        let flashinfer_after_decode = ctx.stream.clone_dtoh(flashinfer_state)?;
+        ctx.sync()?;
+        let row = h_v * decode_fixture.geometry.d;
+        let triton_output = &output[..row];
+        let flashinfer_output = &output[row..];
+
+        log_and_gate(
+            &format!("first-decode CPU/Triton output Hv={h_v} after T={tokens}"),
+            &cpu_decode.output,
+            triton_output,
+            RECURRENCE_OUTPUT_TOLERANCE,
+        )?;
+        log_and_gate(
+            &format!("first-decode CPU/FlashInfer output Hv={h_v} after T={tokens}"),
+            &cpu_decode.output,
+            flashinfer_output,
+            RECURRENCE_OUTPUT_TOLERANCE,
+        )?;
+        log_and_gate(
+            &format!("first-decode Triton/FlashInfer output Hv={h_v} after T={tokens}"),
+            triton_output,
+            flashinfer_output,
+            RECURRENCE_OUTPUT_TOLERANCE,
+        )?;
+        log_and_gate(
+            &format!("first-decode CPU/Triton state Hv={h_v} after T={tokens}"),
+            &cpu_decode.final_state,
+            &triton_after_decode,
+            RECURRENCE_STATE_TOLERANCE,
+        )?;
+        log_and_gate(
+            &format!("first-decode CPU/FlashInfer state Hv={h_v} after T={tokens}"),
+            &cpu_decode.final_state,
+            &flashinfer_after_decode,
+            RECURRENCE_STATE_TOLERANCE,
+        )?;
+        log_and_gate(
+            &format!("first-decode Triton/FlashInfer state Hv={h_v} after T={tokens}"),
+            &triton_after_decode,
+            &flashinfer_after_decode,
+            RECURRENCE_STATE_TOLERANCE,
+        )?;
+        Ok(())
+    }
+
+    fn validate_real_device_fail_closed(
+        ctx: &DeviceContext,
+        backend: &FlashInferGdnBackend,
+        resources: &mut FlashInferGdnChunkResources,
+        initial_state: &CudaSlice<f32>,
+        final_state: &mut CudaSlice<f32>,
+    ) -> Result<()> {
+        let initial_pointer = device_pointer(&ctx.stream, initial_state);
+        let final_pointer = device_pointer_mut(&ctx.stream, final_state);
+        let valid = resources.args_for_state_pointers(ctx, initial_pointer, final_pointer);
+        backend.validate_launch(ctx, &valid)?;
+
+        let mut short_workspace = valid;
+        short_workspace.workspace_bytes = 1;
+        ensure!(
+            backend.validate_launch(ctx, &short_workspace).is_err(),
+            "real-device launch contract accepted an undersized workspace"
+        );
+        ensure!(
+            validate_state_mode(
+                initial_pointer,
+                initial_pointer,
+                FlashInferStateMode::Separate
+            )
+            .is_err(),
+            "real-device launch contract accepted an aliased separate state"
+        );
+
+        let clear_status = unsafe { sys::cuCtxSetCurrent(std::ptr::null_mut()) };
+        ensure!(
+            clear_status == sys::CUresult::CUDA_SUCCESS,
+            "could not clear current CUDA context for negative gate: {clear_status:?}"
+        );
+        let wrong_context = backend.validate_launch(ctx, &valid);
+        // Always restore the model context before inspecting the negative
+        // result so a failed assertion cannot poison subsequent GPU gates.
+        ctx.ctx.bind_to_thread()?;
+        ensure!(
+            wrong_context.is_err(),
+            "real-device launch contract accepted a missing current context"
+        );
+        Ok(())
     }
 
     fn manifest_value(h_v: u32) -> Value {
@@ -1332,9 +1616,13 @@ mod tests {
         assert_eq!(second, Some(3));
     }
 
-    /// Stage 7 entry point: prepare deterministic non-zero native inputs, then
-    /// prove exact alias and separate endpoints produce the same output/state
-    /// through the real SM120 artifact and the same chunk-scoped owner.
+    /// Complete Stage 7 operator/state gate for one manifest geometry.
+    ///
+    /// The runner script invokes this once with Hv32 and once with Hv48.  Each
+    /// invocation compares native prepare against the CPU oracle, compares
+    /// CPU/Triton/FlashInfer prefill output and final state, proves exact alias
+    /// equivalence, then hands both GPU states to the real batched-decode
+    /// kernel for one more token.
     #[test]
     #[ignore = "requires an SM120 GPU and OPENINFER_GDN_STAGE3_MANIFEST"]
     fn sm120_launch_smoke_covers_alias_separate_and_dynamic_t() -> Result<()> {
@@ -1351,53 +1639,82 @@ mod tests {
             let h_k = usize::try_from(backend.geometry().h_k)?;
             let h_v = usize::try_from(backend.geometry().h_v)?;
             let head_dim = usize::try_from(backend.geometry().head_dim)?;
-            let qkv_dim = (h_q + h_k + h_v) * head_dim;
-            let qkv_host: Vec<bf16> = (0..tokens * qkv_dim)
-                .map(|index| bf16::from_f32(((index % 41) as f32 - 20.0) / 64.0))
-                .collect();
-            let b_host: Vec<bf16> = (0..tokens * h_v)
-                .map(|index| bf16::from_f32(((index % 17) as f32 - 8.0) / 16.0))
-                .collect();
-            let a_host: Vec<bf16> = (0..tokens * h_v)
-                .map(|index| bf16::from_f32(((index % 13) as f32 - 6.0) / 32.0))
-                .collect();
-            let qkv = HiddenStates::from_host(&ctx, &qkv_host, qkv_dim, tokens)?;
-            let b = HiddenStates::from_host(&ctx, &b_host, h_v, tokens)?;
-            let a = HiddenStates::from_host(&ctx, &a_host, h_v, tokens)?;
-            let dt_bias = DeviceVec::from_host(
-                &ctx,
-                &(0..h_v)
-                    .map(|head| bf16::from_f32((head as f32 - h_v as f32 / 2.0) / 64.0))
-                    .collect::<Vec<_>>(),
-            )?;
-            let a_log = ctx.stream.clone_htod(
-                &(0..h_v)
-                    .map(|head| -2.0 + head as f32 / (2.0 * h_v as f32))
-                    .collect::<Vec<_>>(),
-            )?;
+            let fixture = deterministic_fixture(tokens, h_v);
+            ensure!(
+                fixture.geometry.h_q == h_q
+                    && fixture.geometry.h_k == h_k
+                    && fixture.geometry.d == head_dim,
+                "Stage 7 fixture geometry does not match manifest"
+            );
+            let expected_prepare = prepare(&fixture).map_err(anyhow::Error::msg)?;
+            let device = upload_fixture(&ctx, &fixture)?;
             crate::ops::gated_delta_rule_prefill_native_prepare_into(
                 &ctx,
-                &qkv,
-                &b,
-                &a,
-                &dt_bias,
-                &a_log,
+                &device.qkv,
+                &device.b,
+                &device.a,
+                &device.dt_bias,
+                &device.a_log,
                 &mut resources.prepare,
                 h_q,
                 h_k,
                 h_v,
                 head_dim,
             )?;
+            validate_gpu_prepare(&ctx, &resources, &expected_prepare, tokens, h_v)?;
 
-            let initial_host: Vec<f32> = (0..state_len)
-                .map(|index| {
-                    let head = index / (head_dim * head_dim);
-                    let rem = index % (head_dim * head_dim);
-                    let key = rem / head_dim;
-                    let value = rem % head_dim;
-                    (head as f32 * 0.01 + key as f32 * 0.0001 + value as f32 * 0.000001) - 0.2
-                })
-                .collect();
+            let initial_host = asymmetric_hkv_state(fixture.geometry);
+            ensure!(
+                initial_host.len() == state_len,
+                "Stage 7 state length mismatch"
+            );
+            let cpu = cpu_stepwise(fixture.geometry, &expected_prepare, &initial_host)
+                .map_err(anyhow::Error::msg)?;
+            if tokens == 1 {
+                let wrong_hvk = transpose_kv_as_wrong_hvk(fixture.geometry, &initial_host);
+                let wrong_cpu = cpu_stepwise(fixture.geometry, &expected_prepare, &wrong_hvk)
+                    .map_err(anyhow::Error::msg)?;
+                let wrong_output = DifferenceStats::compare(
+                    &cpu.output,
+                    &wrong_cpu.output,
+                    RECURRENCE_OUTPUT_TOLERANCE,
+                )
+                .map_err(anyhow::Error::msg)?;
+                let wrong_state = DifferenceStats::compare(
+                    &cpu.final_state,
+                    &wrong_cpu.final_state,
+                    RECURRENCE_STATE_TOLERANCE,
+                )
+                .map_err(anyhow::Error::msg)?;
+                ensure!(
+                    wrong_output.violations > 0 || wrong_state.violations > 0,
+                    "wrong-HVK negative oracle was not detected at Hv={h_v}, T={tokens}"
+                );
+            }
+
+            let mut triton_state = ctx.stream.clone_htod(&initial_host)?;
+            let mut triton_scratch =
+                GdrChunkwiseScratch35::from_dims(&ctx, h_v, head_dim, head_dim, tokens)?;
+            let mut triton_output = HiddenStates::zeros(&ctx, h_v * head_dim, tokens)?;
+            crate::ops::gated_delta_rule_prefill_chunkwise_into(
+                &ctx,
+                &device.qkv,
+                &device.b,
+                &device.a,
+                &device.dt_bias,
+                &device.a_log,
+                &mut triton_state,
+                &mut triton_scratch,
+                &mut triton_output,
+                h_k,
+                h_v,
+                head_dim,
+                head_dim,
+            )?;
+            let triton_output_host = triton_output.to_host(&ctx)?;
+            let triton_final = ctx.stream.clone_dtoh(&triton_state)?;
+            ctx.sync()?;
+
             let mut alias_state = ctx.stream.clone_htod(&initial_host)?;
             resources.launch_in_place(&ctx, &backend, &mut alias_state)?;
             let alias_output = resources.output.to_host(&ctx)?;
@@ -1406,6 +1723,15 @@ mod tests {
 
             let initial_state = ctx.stream.clone_htod(&initial_host)?;
             let mut final_state: CudaSlice<f32> = ctx.stream.alloc_zeros(state_len)?;
+            if tokens == 1 {
+                validate_real_device_fail_closed(
+                    &ctx,
+                    &backend,
+                    &mut resources,
+                    &initial_state,
+                    &mut final_state,
+                )?;
+            }
             resources.launch_separate(&ctx, &backend, &initial_state, &mut final_state)?;
             let separate_output = resources.output.to_host(&ctx)?;
             let separate_final = ctx.stream.clone_dtoh(&final_state)?;
@@ -1434,6 +1760,52 @@ mod tests {
                 alias_final != initial_host,
                 "GDN smoke state did not update at T={tokens}"
             );
+
+            log_and_gate(
+                &format!("prefill CPU/Triton output Hv={h_v} T={tokens}"),
+                &cpu.output,
+                &triton_output_host,
+                RECURRENCE_OUTPUT_TOLERANCE,
+            )?;
+            log_and_gate(
+                &format!("prefill CPU/FlashInfer output Hv={h_v} T={tokens}"),
+                &cpu.output,
+                &alias_output,
+                RECURRENCE_OUTPUT_TOLERANCE,
+            )?;
+            log_and_gate(
+                &format!("prefill Triton/FlashInfer output Hv={h_v} T={tokens}"),
+                &triton_output_host,
+                &alias_output,
+                RECURRENCE_OUTPUT_TOLERANCE,
+            )?;
+            log_and_gate(
+                &format!("prefill CPU/Triton state Hv={h_v} T={tokens}"),
+                &cpu.final_state,
+                &triton_final,
+                RECURRENCE_STATE_TOLERANCE,
+            )?;
+            log_and_gate(
+                &format!("prefill CPU/FlashInfer state Hv={h_v} T={tokens}"),
+                &cpu.final_state,
+                &alias_final,
+                RECURRENCE_STATE_TOLERANCE,
+            )?;
+            log_and_gate(
+                &format!("prefill Triton/FlashInfer state Hv={h_v} T={tokens}"),
+                &triton_final,
+                &alias_final,
+                RECURRENCE_STATE_TOLERANCE,
+            )?;
+
+            run_batched_decode_handoff(
+                &ctx,
+                h_v,
+                &cpu,
+                &mut triton_state,
+                &mut alias_state,
+                tokens,
+            )?;
         }
         Ok(())
     }

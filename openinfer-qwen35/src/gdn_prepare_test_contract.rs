@@ -4,16 +4,16 @@
 //! the workspace CUDA toolchain is unavailable. Inputs and Q/K/V outputs are
 //! represented as raw BF16 bits to freeze rounding and split semantics.
 
-const BOUNDARY_TOKENS: [usize; 7] = [1, 2, 63, 64, 65, 127, 128];
-const D: usize = 128;
+pub(crate) const BOUNDARY_TOKENS: [usize; 7] = [1, 2, 63, 64, 65, 127, 128];
+pub(crate) const D: usize = 128;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct Geometry {
-    h_q: usize,
-    h_k: usize,
-    h_v: usize,
-    d: usize,
-    tokens: usize,
+pub(crate) struct Geometry {
+    pub(crate) h_q: usize,
+    pub(crate) h_k: usize,
+    pub(crate) h_v: usize,
+    pub(crate) d: usize,
+    pub(crate) tokens: usize,
 }
 
 impl Geometry {
@@ -30,29 +30,29 @@ impl Geometry {
         Ok(())
     }
 
-    fn q_len(self) -> usize {
+    pub(crate) fn q_len(self) -> usize {
         self.tokens * self.h_q * self.d
     }
 
-    fn k_len(self) -> usize {
+    pub(crate) fn k_len(self) -> usize {
         self.tokens * self.h_k * self.d
     }
 
-    fn v_len(self) -> usize {
+    pub(crate) fn v_len(self) -> usize {
         self.tokens * self.h_v * self.d
     }
 
-    fn gate_len(self) -> usize {
+    pub(crate) fn gate_len(self) -> usize {
         self.tokens * self.h_v
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ProjectionOffsets {
-    q: usize,
-    k: usize,
-    v: usize,
-    total: usize,
+pub(crate) struct ProjectionOffsets {
+    pub(crate) q: usize,
+    pub(crate) k: usize,
+    pub(crate) v: usize,
+    pub(crate) total: usize,
 }
 
 impl ProjectionOffsets {
@@ -76,30 +76,30 @@ impl ProjectionOffsets {
 }
 
 #[derive(Clone, Debug)]
-struct Fixture {
-    geometry: Geometry,
-    offsets: ProjectionOffsets,
-    qkv: Vec<u16>,
-    b: Vec<u16>,
-    a: Vec<u16>,
-    dt_bias: Vec<u16>,
-    a_log: Vec<f32>,
+pub(crate) struct Fixture {
+    pub(crate) geometry: Geometry,
+    pub(crate) offsets: ProjectionOffsets,
+    pub(crate) qkv: Vec<u16>,
+    pub(crate) b: Vec<u16>,
+    pub(crate) a: Vec<u16>,
+    pub(crate) dt_bias: Vec<u16>,
+    pub(crate) a_log: Vec<f32>,
 }
 
 #[derive(Clone, Debug)]
-struct Prepared {
-    q: Vec<u16>,
-    k: Vec<u16>,
-    v: Vec<u16>,
-    alpha: Vec<f32>,
-    beta: Vec<f32>,
+pub(crate) struct Prepared {
+    pub(crate) q: Vec<u16>,
+    pub(crate) k: Vec<u16>,
+    pub(crate) v: Vec<u16>,
+    pub(crate) alpha: Vec<f32>,
+    pub(crate) beta: Vec<f32>,
 }
 
-fn bf16_to_f32(bits: u16) -> f32 {
+pub(crate) fn bf16_to_f32(bits: u16) -> f32 {
     f32::from_bits(u32::from(bits) << 16)
 }
 
-fn f32_to_bf16(value: f32) -> u16 {
+pub(crate) fn f32_to_bf16(value: f32) -> u16 {
     let bits = value.to_bits();
     let round = 0x7fff + ((bits >> 16) & 1);
     ((bits.wrapping_add(round)) >> 16) as u16
@@ -149,7 +149,7 @@ fn normalize_bf16(input: &[u16], name: &str) -> Result<Vec<u16>, String> {
         .collect())
 }
 
-fn prepare(fixture: &Fixture) -> Result<Prepared, String> {
+pub(crate) fn prepare(fixture: &Fixture) -> Result<Prepared, String> {
     let g = fixture.geometry;
     g.validate()?;
     fixture.offsets.validate(g)?;
@@ -216,7 +216,7 @@ fn prepare(fixture: &Fixture) -> Result<Prepared, String> {
     Ok(output)
 }
 
-fn deterministic_fixture(tokens: usize, h_v: usize) -> Fixture {
+pub(crate) fn deterministic_fixture(tokens: usize, h_v: usize) -> Fixture {
     let geometry = Geometry {
         h_q: 16,
         h_k: 16,

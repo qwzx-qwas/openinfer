@@ -17,6 +17,8 @@ mod gdn_prefill_test_contract;
 mod gdn_prepare_test_contract;
 #[cfg(test)]
 mod gdn_stage6_test_contract;
+#[cfg(test)]
+mod gdn_stage7_test_support;
 mod logprobs;
 mod ops;
 mod prefill;
