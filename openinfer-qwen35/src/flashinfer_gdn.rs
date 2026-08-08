@@ -621,6 +621,15 @@ enum TmaSwizzle {
     B128,
 }
 
+impl TmaSwizzle {
+    const fn inner_box_elements(self) -> u32 {
+        match self {
+            Self::B32 => 16,
+            Self::B128 => 64,
+        }
+    }
+}
+
 fn encode_tma_descriptor(
     pointer: u64,
     tokens: u32,
@@ -632,8 +641,8 @@ fn encode_tma_descriptor(
         "cannot encode a TMA descriptor for a null pointer"
     );
     ensure!(
-        pointer.is_multiple_of(16),
-        "TMA tensor pointer {pointer:#x} is not 16-byte aligned"
+        pointer.is_multiple_of(128),
+        "swizzled TMA tensor pointer {pointer:#x} is not 128-byte aligned"
     );
     ensure!(
         tokens > 0 && heads > 0,
@@ -649,7 +658,11 @@ fn encode_tma_descriptor(
         128_u64 * std::mem::size_of::<half::bf16>() as u64,
         u64::from(heads) * 128 * std::mem::size_of::<half::bf16>() as u64,
     ];
-    let box_dimensions = [128_u32, 1, TMA_TILE_TOKENS];
+    // CuTe's K_SW128 atom covers D=128 with two 64-BF16 TMA operations;
+    // MN_SW32 covers it with eight 16-BF16 operations.  `boxDim[0]` is the
+    // inner dimension of one operation, not the full logical head dimension.
+    // CUDA rejects an inner box wider than the selected swizzle span.
+    let box_dimensions = [swizzle.inner_box_elements(), 1, TMA_TILE_TOKENS];
     let element_strides = [1_u32, 1, 1];
     let mut descriptor = TmaDescriptor { opaque: [0; 16] };
     let cuda_swizzle = match swizzle {
@@ -1523,6 +1536,15 @@ mod tests {
         assert_eq!(align_of::<CompactTensorArg>(), 8);
         assert_eq!(size_of::<TmaDescriptor>(), 128);
         assert_eq!(align_of::<TmaDescriptor>(), 64);
+    }
+
+    #[test]
+    fn tma_inner_box_matches_frozen_smem_swizzle() {
+        let bf16_bytes = size_of::<bf16>() as u32;
+        assert_eq!(TmaSwizzle::B128.inner_box_elements() * bf16_bytes, 128);
+        assert_eq!(TmaSwizzle::B32.inner_box_elements() * bf16_bytes, 32);
+        assert_eq!(128 % TmaSwizzle::B128.inner_box_elements(), 0);
+        assert_eq!(128 % TmaSwizzle::B32.inner_box_elements(), 0);
     }
 
     #[test]
