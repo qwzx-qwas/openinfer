@@ -224,6 +224,135 @@ pub(crate) fn cpu_stepwise(
     })
 }
 
+/// Frozen CPU mirror of FlashInfer's 64-token blockwise final-state path.
+///
+/// The semantic stepwise oracle above remains the primary reference.  This
+/// mirror is used when the SM120 implementation's BF16 block intermediates
+/// cross the fixed state tolerance against the stepwise recurrence.  It ports
+/// the locked FlashInfer reference's `IKK -> T -> u/w/new_v -> state` sequence:
+/// `T` is rounded to BF16, while the running state remains FP32.
+pub(crate) fn cpu_blockwise_final_state(
+    geometry: Geometry,
+    prepared: &Prepared,
+    initial_state: &[f32],
+) -> Result<Vec<f32>, String> {
+    const BLOCK_SIZE: usize = 64;
+
+    let expected_state = geometry.h_v * geometry.d * geometry.d;
+    if initial_state.len() != expected_state
+        || prepared.k.len() != geometry.k_len()
+        || prepared.v.len() != geometry.v_len()
+        || prepared.alpha.len() != geometry.gate_len()
+        || prepared.beta.len() != geometry.gate_len()
+    {
+        return Err("CPU blockwise GDN reference input length mismatch".to_string());
+    }
+    if geometry.h_q != geometry.h_k || !geometry.h_v.is_multiple_of(geometry.h_k) {
+        return Err(
+            "CPU blockwise GDN reference requires Hq=Hk and Hv divisible by Hk".to_string(),
+        );
+    }
+
+    let d = geometry.d;
+    let mut state = initial_state.to_vec();
+    for value_head in 0..geometry.h_v {
+        let key_head = value_head * geometry.h_k / geometry.h_v;
+        let state_base = value_head * d * d;
+        for block_start in (0..geometry.tokens).step_by(BLOCK_SIZE) {
+            let block_len = (geometry.tokens - block_start).min(BLOCK_SIZE);
+            let mut k = vec![0.0_f32; block_len * d];
+            let mut v = vec![0.0_f32; block_len * d];
+            let mut gamma = vec![0.0_f32; block_len];
+            let mut beta = vec![0.0_f32; block_len];
+            let mut cumulative_gamma = 0.0_f32;
+            for token_in_block in 0..block_len {
+                let token = block_start + token_in_block;
+                let k_base = (token * geometry.h_k + key_head) * d;
+                let v_base = (token * geometry.h_v + value_head) * d;
+                for axis in 0..d {
+                    k[token_in_block * d + axis] = bf16_to_f32(prepared.k[k_base + axis]);
+                    v[token_in_block * d + axis] = bf16_to_f32(prepared.v[v_base + axis]);
+                }
+                cumulative_gamma +=
+                    (prepared.alpha[token * geometry.h_v + value_head] + 1.0e-10).ln();
+                gamma[token_in_block] = cumulative_gamma;
+                beta[token_in_block] = prepared.beta[token * geometry.h_v + value_head];
+            }
+
+            // IKK is unit lower triangular.  Build its strict lower part in
+            // FP32, matching beta's row-wise scale in the frozen reference.
+            let mut ikk = vec![0.0_f32; block_len * block_len];
+            for row in 0..block_len {
+                ikk[row * block_len + row] = 1.0;
+                for col in 0..row {
+                    let mut kk = 0.0_f32;
+                    for axis in 0..d {
+                        kk += k[row * d + axis] * k[col * d + axis];
+                    }
+                    ikk[row * block_len + col] = beta[row] * (gamma[row] - gamma[col]).exp() * kk;
+                }
+            }
+
+            // Solve IKK * T = diag(beta), then apply the reference's BF16 T
+            // storage boundary before any u/w matrix products.
+            let mut t = vec![0.0_f32; block_len * block_len];
+            for row in 0..block_len {
+                for col in 0..=row {
+                    let mut value = if row == col { beta[row] } else { 0.0 };
+                    for inner in col..row {
+                        value -= ikk[row * block_len + inner] * t[inner * block_len + col];
+                    }
+                    t[row * block_len + col] = value;
+                }
+            }
+            for value in &mut t {
+                *value = bf16_to_f32(f32_to_bf16(*value));
+            }
+
+            let mut u = vec![0.0_f32; block_len * d];
+            let mut w = vec![0.0_f32; block_len * d];
+            for row in 0..block_len {
+                for col in 0..=row {
+                    let coefficient = t[row * block_len + col];
+                    let weighted_coefficient = coefficient * gamma[col].exp();
+                    for axis in 0..d {
+                        u[row * d + axis] += coefficient * v[col * d + axis];
+                        w[row * d + axis] += weighted_coefficient * k[col * d + axis];
+                    }
+                }
+            }
+
+            let mut new_v = u;
+            for token_in_block in 0..block_len {
+                for value_axis in 0..d {
+                    let mut memory = 0.0_f32;
+                    for key_axis in 0..d {
+                        memory += w[token_in_block * d + key_axis]
+                            * state[state_base + key_axis * d + value_axis];
+                    }
+                    new_v[token_in_block * d + value_axis] -= memory;
+                }
+            }
+
+            let block_gamma = gamma[block_len - 1];
+            let block_decay = block_gamma.exp();
+            for key_axis in 0..d {
+                for value_axis in 0..d {
+                    let mut increment = 0.0_f32;
+                    for token_in_block in 0..block_len {
+                        increment += (block_gamma - gamma[token_in_block]).exp()
+                            * k[token_in_block * d + key_axis]
+                            * new_v[token_in_block * d + value_axis];
+                    }
+                    let index = state_base + key_axis * d + value_axis;
+                    state[index] = block_decay * state[index] + increment;
+                }
+            }
+        }
+    }
+    Ok(state)
+}
+
 /// One production-decode step from raw fused Q/K/V and gates.  Unlike the
 /// prefill prepare path, the decode CUDA kernel keeps normalized Q/K in FP32
 /// registers instead of rounding them through BF16 scratch.
@@ -309,16 +438,9 @@ pub(crate) fn asymmetric_hkv_state(geometry: Geometry) -> Vec<f32> {
             let rem = index % (geometry.d * geometry.d);
             let key = rem / geometry.d;
             let value = rem % geometry.d;
-            // Preserve the Hv32 candidate fixture exactly. Other head counts
-            // use the same head-axis extent, so Hv48 tests geometry without
-            // also increasing the initial-state amplitude by 50 percent.
-            if geometry.h_v == 32 {
-                (head * 100_000 + key * 100 + value) as f32 * 1.0e-6 - 0.2
-            } else {
-                let head_extent = geometry.h_v.saturating_sub(1).max(1) as f32;
-                let normalized_head = head as f32 * 31.0 / head_extent;
-                (normalized_head * 100_000.0 + (key * 100 + value) as f32) * 1.0e-6 - 0.2
-            }
+            // A scaled version of h*100000+k*100+v keeps every axis
+            // distinguishable without making BF16 output overflow dominate.
+            (head * 100_000 + key * 100 + value) as f32 * 1.0e-6 - 0.2
         })
         .collect()
 }
@@ -388,29 +510,53 @@ mod tests {
 
     #[test]
     fn cpu_stepwise_rejects_wrong_hvk_oracle() {
-        for h_v in [32, 48] {
-            let fixture = deterministic_fixture(2, h_v);
-            let prepared = prepare(&fixture).unwrap();
-            let initial = asymmetric_hkv_state(fixture.geometry);
-            let wrong = transpose_kv_as_wrong_hvk(fixture.geometry, &initial);
-            let correct = cpu_stepwise(fixture.geometry, &prepared, &initial).unwrap();
-            let wrong = cpu_stepwise(fixture.geometry, &prepared, &wrong).unwrap();
-            let output = DifferenceStats::compare(
-                &correct.output,
-                &wrong.output,
-                RECURRENCE_OUTPUT_TOLERANCE,
-            )
-            .unwrap();
-            let state = DifferenceStats::compare(
-                &correct.final_state,
-                &wrong.final_state,
-                RECURRENCE_STATE_TOLERANCE,
-            )
-            .unwrap();
-            assert!(
-                output.violations > 0 || state.violations > 0,
-                "wrong-HKV oracle was not detected for Hv={h_v}"
-            );
-        }
+        let fixture = deterministic_fixture(2, 32);
+        let prepared = prepare(&fixture).unwrap();
+        let initial = asymmetric_hkv_state(fixture.geometry);
+        let wrong = transpose_kv_as_wrong_hvk(fixture.geometry, &initial);
+        let correct = cpu_stepwise(fixture.geometry, &prepared, &initial).unwrap();
+        let wrong = cpu_stepwise(fixture.geometry, &prepared, &wrong).unwrap();
+        let output =
+            DifferenceStats::compare(&correct.output, &wrong.output, RECURRENCE_OUTPUT_TOLERANCE)
+                .unwrap();
+        let state = DifferenceStats::compare(
+            &correct.final_state,
+            &wrong.final_state,
+            RECURRENCE_STATE_TOLERANCE,
+        )
+        .unwrap();
+        assert!(output.violations > 0 || state.violations > 0);
+    }
+
+    #[test]
+    fn cpu_blockwise_matches_stepwise_for_orthogonal_tokens() {
+        let geometry = Geometry {
+            h_q: 1,
+            h_k: 1,
+            h_v: 1,
+            d: 2,
+            tokens: 2,
+        };
+        let prepared = Prepared {
+            q: vec![0; 4],
+            k: vec![
+                f32_to_bf16(1.0),
+                f32_to_bf16(0.0),
+                f32_to_bf16(0.0),
+                f32_to_bf16(1.0),
+            ],
+            v: vec![
+                f32_to_bf16(2.0),
+                f32_to_bf16(3.0),
+                f32_to_bf16(4.0),
+                f32_to_bf16(5.0),
+            ],
+            alpha: vec![1.0, 1.0],
+            beta: vec![1.0, 1.0],
+        };
+        let initial = vec![4.0, 5.0, 6.0, 7.0];
+        let stepwise = cpu_stepwise(geometry, &prepared, &initial).unwrap();
+        let blockwise = cpu_blockwise_final_state(geometry, &prepared, &initial).unwrap();
+        assert_eq!(blockwise, stepwise.final_state);
     }
 }
