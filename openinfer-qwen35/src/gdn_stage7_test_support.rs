@@ -309,9 +309,16 @@ pub(crate) fn asymmetric_hkv_state(geometry: Geometry) -> Vec<f32> {
             let rem = index % (geometry.d * geometry.d);
             let key = rem / geometry.d;
             let value = rem % geometry.d;
-            // A scaled version of h*100000+k*100+v keeps every axis
-            // distinguishable without making BF16 output overflow dominate.
-            (head * 100_000 + key * 100 + value) as f32 * 1.0e-6 - 0.2
+            // Preserve the Hv32 candidate fixture exactly. Other head counts
+            // use the same head-axis extent, so Hv48 tests geometry without
+            // also increasing the initial-state amplitude by 50 percent.
+            if geometry.h_v == 32 {
+                (head * 100_000 + key * 100 + value) as f32 * 1.0e-6 - 0.2
+            } else {
+                let head_extent = geometry.h_v.saturating_sub(1).max(1) as f32;
+                let normalized_head = head as f32 * 31.0 / head_extent;
+                (normalized_head * 100_000.0 + (key * 100 + value) as f32) * 1.0e-6 - 0.2
+            }
         })
         .collect()
 }
@@ -381,21 +388,29 @@ mod tests {
 
     #[test]
     fn cpu_stepwise_rejects_wrong_hvk_oracle() {
-        let fixture = deterministic_fixture(2, 32);
-        let prepared = prepare(&fixture).unwrap();
-        let initial = asymmetric_hkv_state(fixture.geometry);
-        let wrong = transpose_kv_as_wrong_hvk(fixture.geometry, &initial);
-        let correct = cpu_stepwise(fixture.geometry, &prepared, &initial).unwrap();
-        let wrong = cpu_stepwise(fixture.geometry, &prepared, &wrong).unwrap();
-        let output =
-            DifferenceStats::compare(&correct.output, &wrong.output, RECURRENCE_OUTPUT_TOLERANCE)
-                .unwrap();
-        let state = DifferenceStats::compare(
-            &correct.final_state,
-            &wrong.final_state,
-            RECURRENCE_STATE_TOLERANCE,
-        )
-        .unwrap();
-        assert!(output.violations > 0 || state.violations > 0);
+        for h_v in [32, 48] {
+            let fixture = deterministic_fixture(2, h_v);
+            let prepared = prepare(&fixture).unwrap();
+            let initial = asymmetric_hkv_state(fixture.geometry);
+            let wrong = transpose_kv_as_wrong_hvk(fixture.geometry, &initial);
+            let correct = cpu_stepwise(fixture.geometry, &prepared, &initial).unwrap();
+            let wrong = cpu_stepwise(fixture.geometry, &prepared, &wrong).unwrap();
+            let output = DifferenceStats::compare(
+                &correct.output,
+                &wrong.output,
+                RECURRENCE_OUTPUT_TOLERANCE,
+            )
+            .unwrap();
+            let state = DifferenceStats::compare(
+                &correct.final_state,
+                &wrong.final_state,
+                RECURRENCE_STATE_TOLERANCE,
+            )
+            .unwrap();
+            assert!(
+                output.violations > 0 || state.violations > 0,
+                "wrong-HKV oracle was not detected for Hv={h_v}"
+            );
+        }
     }
 }
