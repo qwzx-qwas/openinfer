@@ -12,6 +12,9 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
 use anyhow::Context;
 use anyhow::Result;
@@ -227,6 +230,7 @@ struct Distribution {
 struct ValidatedArtifact {
     manifest_path: PathBuf,
     ptx_path: PathBuf,
+    artifact_sha256: String,
     geometry: Geometry,
     variant: String,
     entry_symbol: String,
@@ -244,6 +248,7 @@ pub(super) struct FlashInferGdnBackend {
     creation_context: usize,
     device_ordinal: usize,
     sm_count: u32,
+    successful_launches: Arc<AtomicU64>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -318,6 +323,7 @@ impl FlashInferGdnBackend {
             creation_context,
             device_ordinal: ctx.device_ordinal,
             sm_count,
+            successful_launches: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -450,7 +456,21 @@ impl FlashInferGdnBackend {
         // ownership were all checked immediately before this async launch.
         unsafe { launch.launch(config) }
             .map_err(|error| anyhow::anyhow!("FlashInfer GDN launch failed: {error}"))?;
+        self.successful_launches.fetch_add(1, Ordering::Relaxed);
         Ok(())
+    }
+
+    pub(super) fn successful_launch_counter(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.successful_launches)
+    }
+
+    pub(super) fn artifact_identity(&self) -> (&Path, &Path, &str, &str) {
+        (
+            &self.artifact.manifest_path,
+            &self.artifact.ptx_path,
+            &self.artifact.variant,
+            &self.artifact.artifact_sha256,
+        )
     }
 }
 
@@ -830,6 +850,7 @@ fn load_and_validate_artifact(manifest_path: &Path) -> Result<(ValidatedArtifact
         ValidatedArtifact {
             manifest_path: manifest_path.to_owned(),
             ptx_path,
+            artifact_sha256: manifest.artifact.sha256,
             geometry: manifest.geometry,
             variant: manifest.variant,
             entry_symbol: manifest.abi.entry_symbol,
@@ -989,6 +1010,7 @@ fn load_and_validate_upstream_hvk_artifact(
         ValidatedArtifact {
             manifest_path: manifest_path.to_owned(),
             ptx_path,
+            artifact_sha256: manifest.artifact.sha256,
             geometry: manifest.geometry,
             variant: manifest.variant,
             entry_symbol: manifest.abi.entry_symbol,

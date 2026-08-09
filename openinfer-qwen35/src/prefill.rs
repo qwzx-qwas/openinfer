@@ -1,3 +1,8 @@
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
+
 use anyhow::Result;
 use cudarc::driver::CudaSlice;
 use cudarc::driver::DevicePtr;
@@ -62,6 +67,42 @@ pub struct GdnPrefillComparison {
     pub conv_state_max_abs: f32,
 }
 
+/// Runtime proof that an explicitly selected FlashInfer GDN test path loaded
+/// the pinned artifact and actually launched it. Production dispatch does not
+/// expose or consume this diagnostic surface.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GdnPrefillRuntimeEvidence {
+    pub manifest_path: PathBuf,
+    pub ptx_path: PathBuf,
+    pub variant: String,
+    pub artifact_sha256: String,
+    pub successful_launches: u64,
+}
+
+/// Cloneable test/benchmark proof that remains readable after a model moves
+/// into the scheduler thread. It owns no CUDA resources and cannot select a
+/// backend; it only snapshots identity plus the shared successful-launch count.
+#[derive(Clone, Debug)]
+pub struct GdnPrefillRuntimeEvidenceHandle {
+    manifest_path: PathBuf,
+    ptx_path: PathBuf,
+    variant: String,
+    artifact_sha256: String,
+    successful_launches: Arc<AtomicU64>,
+}
+
+impl GdnPrefillRuntimeEvidenceHandle {
+    pub fn snapshot(&self) -> GdnPrefillRuntimeEvidence {
+        GdnPrefillRuntimeEvidence {
+            manifest_path: self.manifest_path.clone(),
+            ptx_path: self.ptx_path.clone(),
+            variant: self.variant.clone(),
+            artifact_sha256: self.artifact_sha256.clone(),
+            successful_launches: self.successful_launches.load(Ordering::Relaxed),
+        }
+    }
+}
+
 fn update_max_abs(max_abs: &mut f32, left: &[f32], right: &[f32]) -> Result<()> {
     anyhow::ensure!(
         left.len() == right.len(),
@@ -103,6 +144,26 @@ impl Qwen35Model {
         manifest_path: &std::path::Path,
     ) -> Result<()> {
         self.install_flashinfer_gdn(manifest_path)
+    }
+
+    /// Snapshot the installed candidate's pinned identity and successful
+    /// launch count. Missing installation fails closed.
+    pub fn flashinfer_gdn_runtime_evidence(&self) -> Result<GdnPrefillRuntimeEvidence> {
+        Ok(self.flashinfer_gdn_runtime_evidence_handle()?.snapshot())
+    }
+
+    pub fn flashinfer_gdn_runtime_evidence_handle(
+        &self,
+    ) -> Result<GdnPrefillRuntimeEvidenceHandle> {
+        let backend = self.flashinfer_gdn()?;
+        let (manifest_path, ptx_path, variant, artifact_sha256) = backend.artifact_identity();
+        Ok(GdnPrefillRuntimeEvidenceHandle {
+            manifest_path: manifest_path.to_owned(),
+            ptx_path: ptx_path.to_owned(),
+            variant: variant.to_owned(),
+            artifact_sha256: artifact_sha256.to_owned(),
+            successful_launches: backend.successful_launch_counter(),
+        })
     }
 
     /// Allocate an empty request state for one side of a GDN benchmark.
@@ -216,6 +277,21 @@ impl Qwen35Model {
         kv_state: &mut KvState,
         recurrent: &mut RecurrentState,
     ) -> Result<DeviceVec> {
+        self.prefill_last_hidden_with_gdn_backend(
+            token_ids,
+            kv_state,
+            recurrent,
+            GdnPrefillBackendSeam::Triton,
+        )
+    }
+
+    pub(crate) fn prefill_last_hidden_with_gdn_backend(
+        &self,
+        token_ids: &[u32],
+        kv_state: &mut KvState,
+        recurrent: &mut RecurrentState,
+        gdn_backend: GdnPrefillBackendSeam,
+    ) -> Result<DeviceVec> {
         let seq_len = token_ids.len();
         anyhow::ensure!(
             seq_len > 0,
@@ -240,7 +316,17 @@ impl Qwen35Model {
             // Free the previous chunk's hidden states before allocating the next
             // chunk's scratch so peak memory stays within one chunk's reservation.
             drop(hidden_batch.take());
-            hidden_batch = Some(self.prefill_chunk_forward(chunk, kv_state, recurrent)?);
+            hidden_batch = Some(match gdn_backend {
+                GdnPrefillBackendSeam::Triton => {
+                    self.prefill_chunk_forward(chunk, kv_state, recurrent)?
+                }
+                GdnPrefillBackendSeam::FlashInfer => self.prefill_chunk_forward_with_gdn_backend(
+                    chunk,
+                    kv_state,
+                    recurrent,
+                    GdnPrefillBackendSeam::FlashInfer,
+                )?,
+            });
         }
         // `seq_len > 0` guarantees at least one chunk produced hidden states.
         let hidden_batch = hidden_batch.expect("prefill produced no chunk despite seq_len > 0");
