@@ -1349,20 +1349,22 @@ mod tests {
         })
     }
 
-    fn prepared_token(
+    fn prepared_range(
         prepared: &Prepared,
         geometry: PrepareGeometry,
-        token: usize,
+        start: usize,
+        end: usize,
     ) -> Result<Prepared> {
-        ensure!(token < geometry.tokens, "prepared token index out of range");
+        ensure!(
+            start < end && end <= geometry.tokens,
+            "prepared token range out of bounds"
+        );
         let q_stride = geometry.h_q * geometry.d;
         let k_stride = geometry.h_k * geometry.d;
         let v_stride = geometry.h_v * geometry.d;
         let gate_stride = geometry.h_v;
-        let take =
-            |values: &[u16], stride: usize| values[token * stride..(token + 1) * stride].to_vec();
-        let take_gate =
-            |values: &[f32]| values[token * gate_stride..(token + 1) * gate_stride].to_vec();
+        let take = |values: &[u16], stride: usize| values[start * stride..end * stride].to_vec();
+        let take_gate = |values: &[f32]| values[start * gate_stride..end * gate_stride].to_vec();
         Ok(Prepared {
             q: take(&prepared.q, q_stride),
             k: take(&prepared.k, k_stride),
@@ -1372,29 +1374,33 @@ mod tests {
         })
     }
 
-    fn launch_flashinfer_prepared_t1(
+    fn launch_flashinfer_prepared(
         ctx: &DeviceContext,
         backend: &FlashInferGdnBackend,
         config: &Config35,
         prepared: &Prepared,
+        tokens: usize,
         initial_state: &[f32],
         repeats: usize,
     ) -> Result<CpuRunResult> {
-        ensure!(repeats > 0, "T=1 diagnostic requires at least one repeat");
+        ensure!(
+            tokens > 0 && repeats > 0,
+            "FlashInfer split diagnostic requires tokens and repeats"
+        );
         let h_q = config.linear_num_key_heads;
         let h_k = config.linear_num_key_heads;
         let h_v = config.linear_num_value_heads;
         let d = config.linear_key_head_dim;
         ensure!(
-            prepared.q.len() == h_q * d
-                && prepared.k.len() == h_k * d
-                && prepared.v.len() == h_v * d
-                && prepared.alpha.len() == h_v
-                && prepared.beta.len() == h_v,
-            "T=1 diagnostic prepared lengths do not match manifest geometry"
+            prepared.q.len() == tokens * h_q * d
+                && prepared.k.len() == tokens * h_k * d
+                && prepared.v.len() == tokens * h_v * d
+                && prepared.alpha.len() == tokens * h_v
+                && prepared.beta.len() == tokens * h_v,
+            "FlashInfer split diagnostic prepared lengths do not match manifest geometry"
         );
 
-        let mut resources = FlashInferGdnChunkResources::new(ctx, config, backend, 1)?;
+        let mut resources = FlashInferGdnChunkResources::new(ctx, config, backend, tokens)?;
         let q: Vec<bf16> = prepared.q.iter().copied().map(bf16::from_bits).collect();
         let k: Vec<bf16> = prepared.k.iter().copied().map(bf16::from_bits).collect();
         let v: Vec<bf16> = prepared.v.iter().copied().map(bf16::from_bits).collect();
@@ -1421,13 +1427,13 @@ mod tests {
             if let Some(expected) = &first {
                 ensure!(
                     run.output == expected.output && run.final_state == expected.final_state,
-                    "FlashInfer T=1 diagnostic was not bitwise deterministic at repeat {repeat}"
+                    "FlashInfer T={tokens} split diagnostic was not bitwise deterministic at repeat {repeat}"
                 );
             } else {
                 first = Some(run);
             }
         }
-        first.context("T=1 diagnostic did not execute")
+        first.context("FlashInfer split diagnostic did not execute")
     }
 
     fn violation_details(
@@ -1456,68 +1462,89 @@ mod tests {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn log_hv48_t65_attribution(
-        cpu_t65: &CpuRunResult,
-        flashinfer_t65_output: &[f32],
-        flashinfer_t65_state: &[f32],
+    fn log_hv48_split_attribution(
+        cpu_full: &CpuRunResult,
+        flashinfer_full_output: &[f32],
+        flashinfer_full_state: &[f32],
         cpu_t64_state: &[f32],
         flashinfer_t64_state: &[f32],
-        prepared_t65: &Prepared,
+        prepared_full: &Prepared,
         geometry: PrepareGeometry,
+        repeats: usize,
         ctx: &DeviceContext,
         backend: &FlashInferGdnBackend,
         config: &Config35,
     ) -> Result<()> {
-        ensure!(geometry.tokens == 65, "Hv48 tail attribution requires T=65");
-        let tail = prepared_token(prepared_t65, geometry, 64)?;
-        let mut tail_geometry = geometry;
-        tail_geometry.tokens = 1;
+        ensure!(
+            geometry.tokens > 64,
+            "Hv48 split attribution requires more than 64 tokens"
+        );
+        let tokens = geometry.tokens;
+        let suffix_tokens = tokens - 64;
+        let suffix = prepared_range(prepared_full, geometry, 64, tokens)?;
+        let mut suffix_geometry = geometry;
+        suffix_geometry.tokens = suffix_tokens;
 
         let a_cpu_from_cpu =
-            cpu_stepwise(tail_geometry, &tail, cpu_t64_state).map_err(anyhow::Error::msg)?;
-        let b_cpu_from_flashinfer =
-            cpu_stepwise(tail_geometry, &tail, flashinfer_t64_state).map_err(anyhow::Error::msg)?;
-        let c_flashinfer_from_cpu =
-            launch_flashinfer_prepared_t1(ctx, backend, config, &tail, cpu_t64_state, 1)?;
-        let d_flashinfer_from_flashinfer =
-            launch_flashinfer_prepared_t1(ctx, backend, config, &tail, flashinfer_t64_state, 10)?;
+            cpu_stepwise(suffix_geometry, &suffix, cpu_t64_state).map_err(anyhow::Error::msg)?;
+        let b_cpu_from_flashinfer = cpu_stepwise(suffix_geometry, &suffix, flashinfer_t64_state)
+            .map_err(anyhow::Error::msg)?;
+        let c_flashinfer_from_cpu = launch_flashinfer_prepared(
+            ctx,
+            backend,
+            config,
+            &suffix,
+            suffix_tokens,
+            cpu_t64_state,
+            1,
+        )?;
+        let d_flashinfer_from_flashinfer = launch_flashinfer_prepared(
+            ctx,
+            backend,
+            config,
+            &suffix,
+            suffix_tokens,
+            flashinfer_t64_state,
+            repeats,
+        )?;
 
         let tail_output_start = 64 * geometry.h_v * geometry.d;
-        let flashinfer_t65_tail_output = &flashinfer_t65_output[tail_output_start..];
+        let flashinfer_full_tail_output = &flashinfer_full_output[tail_output_start..];
         eprintln!(
-            "Hv48 T=65 decomposition consistency: CPU65==CPU64+CPU-T1 state={}, FlashInfer65==FlashInfer64+FlashInfer-T1 state={}, output={}, T1_repeat10=bitwise",
-            cpu_t65.final_state == a_cpu_from_cpu.final_state,
-            flashinfer_t65_state == d_flashinfer_from_flashinfer.final_state,
-            flashinfer_t65_tail_output == d_flashinfer_from_flashinfer.output,
+            "Hv48 T={tokens} split64 consistency: CPU-full==CPU64+CPU-T{suffix_tokens} state={}, FlashInfer-full==FlashInfer64+FlashInfer-T{suffix_tokens} state={}, output={}, split_repeat{repeats}=bitwise",
+            cpu_full.final_state == a_cpu_from_cpu.final_state,
+            flashinfer_full_state == d_flashinfer_from_flashinfer.final_state,
+            flashinfer_full_tail_output == d_flashinfer_from_flashinfer.output,
         );
 
-        for (label, reference, candidate) in [
-            (
-                "Hv48 T=65 prefix propagation CPU(S64_cpu)->CPU(S64_flashinfer)",
-                a_cpu_from_cpu.final_state.as_slice(),
-                b_cpu_from_flashinfer.final_state.as_slice(),
+        log_difference_stats(
+            &format!("Hv48 T={tokens} prefix propagation CPU(S64_cpu)->CPU(S64_flashinfer)"),
+            &a_cpu_from_cpu.final_state,
+            &b_cpu_from_flashinfer.final_state,
+            RECURRENCE_STATE_TOLERANCE,
+        )?;
+        log_difference_stats(
+            &format!(
+                "Hv48 T={tokens} suffix path CPU-T{suffix_tokens}/FlashInfer-T{suffix_tokens} from S64_cpu"
             ),
-            (
-                "Hv48 T=65 tail path CPU-T1/FlashInfer-T1 from S64_cpu",
-                a_cpu_from_cpu.final_state.as_slice(),
-                c_flashinfer_from_cpu.final_state.as_slice(),
-            ),
-            (
-                "Hv48 T=65 composed/full FlashInfer",
-                d_flashinfer_from_flashinfer.final_state.as_slice(),
-                flashinfer_t65_state,
-            ),
-        ] {
-            log_difference_stats(label, reference, candidate, RECURRENCE_STATE_TOLERANCE)?;
-        }
+            &a_cpu_from_cpu.final_state,
+            &c_flashinfer_from_cpu.final_state,
+            RECURRENCE_STATE_TOLERANCE,
+        )?;
+        log_difference_stats(
+            &format!("Hv48 T={tokens} split64/full FlashInfer"),
+            &d_flashinfer_from_flashinfer.final_state,
+            flashinfer_full_state,
+            RECURRENCE_STATE_TOLERANCE,
+        )?;
 
         let violations = violation_details(
-            &cpu_t65.final_state,
-            flashinfer_t65_state,
+            &cpu_full.final_state,
+            flashinfer_full_state,
             RECURRENCE_STATE_TOLERANCE,
         );
         eprintln!(
-            "Hv48 T=65 exact state violations: {} (printing all)",
+            "Hv48 T={tokens} exact state violations: {} (printing all)",
             violations.len()
         );
         for difference in violations {
@@ -1527,7 +1554,7 @@ mod tests {
             let key = remainder / geometry.d;
             let value = remainder % geometry.d;
             eprintln!(
-                "Hv48 T=65 violation index={} (h={head},k={key},v={value}) cpu65={} flashinfer65={} abs={} allowed={} excess={} | A_cpu64_cpu1={} B_fi64_cpu1={} C_cpu64_fi1={} D_fi64_fi1={} prefix_effect={} tail_effect={} composition_effect={}",
+                "Hv48 T={tokens} violation index={} (h={head},k={key},v={value}) cpu_full={} flashinfer_full={} abs={} allowed={} excess={} | A_cpu64_cpu_suffix={} B_fi64_cpu_suffix={} C_cpu64_fi_suffix={} D_fi64_fi_suffix={} prefix_effect={} suffix_effect={} interaction_effect={} split_full_effect={}",
                 difference.index,
                 difference.reference,
                 difference.candidate,
@@ -1542,7 +1569,11 @@ mod tests {
                     - a_cpu_from_cpu.final_state[difference.index],
                 c_flashinfer_from_cpu.final_state[difference.index]
                     - a_cpu_from_cpu.final_state[difference.index],
-                flashinfer_t65_state[difference.index]
+                d_flashinfer_from_flashinfer.final_state[difference.index]
+                    - b_cpu_from_flashinfer.final_state[difference.index]
+                    - c_flashinfer_from_cpu.final_state[difference.index]
+                    + a_cpu_from_cpu.final_state[difference.index],
+                flashinfer_full_state[difference.index]
                     - d_flashinfer_from_flashinfer.final_state[difference.index],
             );
         }
@@ -1965,22 +1996,25 @@ mod tests {
     }
 
     #[test]
-    fn stage7_tail_diagnostic_slices_token_64_without_regenerating_fixture() {
-        let fixture = deterministic_fixture(65, 48);
+    fn stage7_split_diagnostic_slices_suffix_without_regenerating_fixture() {
+        let fixture = deterministic_fixture(128, 48);
         let prepared = prepare(&fixture).unwrap();
-        let tail = prepared_token(&prepared, fixture.geometry, 64).unwrap();
+        let suffix = prepared_range(&prepared, fixture.geometry, 64, 128).unwrap();
         let q_stride = fixture.geometry.h_q * fixture.geometry.d;
         let k_stride = fixture.geometry.h_k * fixture.geometry.d;
         let v_stride = fixture.geometry.h_v * fixture.geometry.d;
         let gate_stride = fixture.geometry.h_v;
-        assert_eq!(tail.q, prepared.q[64 * q_stride..65 * q_stride]);
-        assert_eq!(tail.k, prepared.k[64 * k_stride..65 * k_stride]);
-        assert_eq!(tail.v, prepared.v[64 * v_stride..65 * v_stride]);
+        assert_eq!(suffix.q, prepared.q[64 * q_stride..128 * q_stride]);
+        assert_eq!(suffix.k, prepared.k[64 * k_stride..128 * k_stride]);
+        assert_eq!(suffix.v, prepared.v[64 * v_stride..128 * v_stride]);
         assert_eq!(
-            tail.alpha,
-            prepared.alpha[64 * gate_stride..65 * gate_stride]
+            suffix.alpha,
+            prepared.alpha[64 * gate_stride..128 * gate_stride]
         );
-        assert_eq!(tail.beta, prepared.beta[64 * gate_stride..65 * gate_stride]);
+        assert_eq!(
+            suffix.beta,
+            prepared.beta[64 * gate_stride..128 * gate_stride]
+        );
     }
 
     #[test]
@@ -2250,19 +2284,21 @@ mod tests {
                 RECURRENCE_STATE_TOLERANCE,
             )?;
 
-            if h_v == 48 && tokens == 65 && cpu_flashinfer_state_stats.violations > 0 {
-                log_hv48_t65_attribution(
+            if h_v == 48 && matches!(tokens, 65 | 128) && cpu_flashinfer_state_stats.violations > 0
+            {
+                log_hv48_split_attribution(
                     &cpu,
                     &alias_output,
                     &alias_final,
                     cpu_t64_state
                         .as_deref()
-                        .context("Hv48 T=65 diagnostic is missing CPU T=64 state")?,
+                        .context("Hv48 split diagnostic is missing CPU T=64 state")?,
                     flashinfer_t64_state
                         .as_deref()
-                        .context("Hv48 T=65 diagnostic is missing FlashInfer T=64 state")?,
+                        .context("Hv48 split diagnostic is missing FlashInfer T=64 state")?,
                     &actual_prepare,
                     fixture.geometry,
+                    if tokens == 65 { 10 } else { 3 },
                     &ctx,
                     &backend,
                     &config,
