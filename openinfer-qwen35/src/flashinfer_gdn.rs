@@ -1200,6 +1200,7 @@ mod tests {
     use crate::gdn_stage7_test_support::asymmetric_hkv_state;
     use crate::gdn_stage7_test_support::cpu_decode_from_raw;
     use crate::gdn_stage7_test_support::cpu_stepwise;
+    use crate::gdn_stage7_test_support::cpu_stepwise_f64_rounded;
     use crate::gdn_stage7_test_support::transpose_kv_as_wrong_hvk;
     use crate::prefill_buffers::GdrChunkwiseScratch35;
 
@@ -1459,6 +1460,37 @@ mod tests {
                 })
             })
             .collect()
+    }
+
+    fn log_state_violation_details(
+        label: &str,
+        reference: &[f32],
+        candidate: &[f32],
+        geometry: PrepareGeometry,
+    ) {
+        let violations = violation_details(reference, candidate, RECURRENCE_STATE_TOLERANCE);
+        eprintln!(
+            "{label} exact state violations: {} (printing all)",
+            violations.len()
+        );
+        for difference in violations {
+            let head_stride = geometry.d * geometry.d;
+            let head = difference.index / head_stride;
+            let remainder = difference.index % head_stride;
+            let key = remainder / geometry.d;
+            let value = remainder % geometry.d;
+            let excess = difference.abs_diff - difference.allowed;
+            eprintln!(
+                "{label} violation index={} (h={head},k={key},v={value}) reference={} candidate={} abs={} allowed={} excess={} normalized_excess={}",
+                difference.index,
+                difference.reference,
+                difference.candidate,
+                difference.abs_diff,
+                difference.allowed,
+                excess,
+                excess / difference.allowed,
+            );
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2098,6 +2130,14 @@ mod tests {
             );
             let cpu = cpu_stepwise(fixture.geometry, &actual_prepare, &initial_host)
                 .map_err(anyhow::Error::msg)?;
+            let cpu_f64 = if h_v == 48 && matches!(tokens, 65 | 128) {
+                Some(
+                    cpu_stepwise_f64_rounded(fixture.geometry, &actual_prepare, &initial_host)
+                        .map_err(anyhow::Error::msg)?,
+                )
+            } else {
+                None
+            };
             if tokens == 1 {
                 let wrong_hvk = transpose_kv_as_wrong_hvk(fixture.geometry, &initial_host);
                 let wrong_cpu = cpu_stepwise(fixture.geometry, &actual_prepare, &wrong_hvk)
@@ -2292,6 +2332,69 @@ mod tests {
                 &alias_final,
                 RECURRENCE_STATE_TOLERANCE,
             )?;
+
+            if let Some(fp64) = &cpu_f64 {
+                for (label, candidate) in [
+                    (
+                        format!("prefill FP64-rounded/CPU-FP32 state Hv={h_v} T={tokens}"),
+                        cpu.final_state.as_slice(),
+                    ),
+                    (
+                        format!("prefill FP64-rounded/Triton state Hv={h_v} T={tokens}"),
+                        triton_final.as_slice(),
+                    ),
+                    (
+                        format!("prefill FP64-rounded/FlashInfer state Hv={h_v} T={tokens}"),
+                        alias_final.as_slice(),
+                    ),
+                ] {
+                    log_difference_stats(
+                        &label,
+                        &fp64.final_state,
+                        candidate,
+                        RECURRENCE_STATE_TOLERANCE,
+                    )?;
+                    log_state_violation_details(
+                        &label,
+                        &fp64.final_state,
+                        candidate,
+                        fixture.geometry,
+                    );
+                }
+                for (label, candidate) in [
+                    (
+                        format!("prefill FP64-rounded/CPU-FP32 output Hv={h_v} T={tokens}"),
+                        cpu.output.as_slice(),
+                    ),
+                    (
+                        format!("prefill FP64-rounded/Triton output Hv={h_v} T={tokens}"),
+                        triton_output_host.as_slice(),
+                    ),
+                    (
+                        format!("prefill FP64-rounded/FlashInfer output Hv={h_v} T={tokens}"),
+                        alias_output.as_slice(),
+                    ),
+                ] {
+                    log_difference_stats(
+                        &label,
+                        &fp64.output,
+                        candidate,
+                        RECURRENCE_OUTPUT_TOLERANCE,
+                    )?;
+                }
+                log_state_violation_details(
+                    &format!("prefill CPU-FP32/Triton state Hv={h_v} T={tokens}"),
+                    &cpu.final_state,
+                    &triton_final,
+                    fixture.geometry,
+                );
+                log_state_violation_details(
+                    &format!("prefill CPU-FP32/FlashInfer state Hv={h_v} T={tokens}"),
+                    &cpu.final_state,
+                    &alias_final,
+                    fixture.geometry,
+                );
+            }
 
             if h_v == 48 && matches!(tokens, 65 | 128) && cpu_flashinfer_state_stats.violations > 0
             {

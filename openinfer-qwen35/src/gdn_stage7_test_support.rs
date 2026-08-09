@@ -47,12 +47,11 @@ pub(crate) const RECURRENCE_STATE_TOLERANCE: NumericTolerance = NumericTolerance
 // Hv48 is operator-only coverage rather than a supported model geometry.  Keep
 // the frozen elementwise state bound as the primary gate, but permit a tiny
 // numeric tail only when FlashInfer is strictly no worse than the existing
-// Triton baseline on the distribution statistics. Violation count has its own
-// hard cap because counting samples on either side of one threshold is much
-// less stable than max/mean/p99. The excess cap is half a BF16 ULP at the
-// observed O(1e-1) state scale.
+// Triton baseline on every aggregate statistic. The narrow excess cap retains
+// the explained T=65 boundary tail but deliberately rejects the deeper T=128
+// suffix-block error until the FP64-oracle audit establishes a final envelope.
 const HV48_OPERATOR_STATE_MAX_VIOLATIONS: usize = 8;
-const HV48_OPERATOR_STATE_MAX_EXCESS: f32 = 1.0 / 2_048.0;
+const HV48_OPERATOR_STATE_MAX_EXCESS: f32 = 1.0 / 16_384.0;
 const HV48_OPERATOR_STATE_ELEMENTS: usize = 48 * 128 * 128;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -194,19 +193,20 @@ impl DifferenceStats {
                 self.max_excess, HV48_OPERATOR_STATE_MAX_EXCESS
             ));
         }
-        let distribution_dominated = self.max_abs <= triton_baseline.max_abs
+        let dominated = self.violations <= triton_baseline.violations
+            && self.max_abs <= triton_baseline.max_abs
             && self.mean_abs <= triton_baseline.mean_abs
             && self.p99_abs <= triton_baseline.p99_abs;
-        if !distribution_dominated {
+        if !dominated {
             return Err(format!(
-                "{label} Hv48 operator numeric-tail distribution does not dominate Triton baseline: FlashInfer={self:?}, Triton={triton_baseline:?}"
+                "{label} Hv48 operator numeric tail does not dominate Triton baseline: FlashInfer={self:?}, Triton={triton_baseline:?}"
             ));
         }
         Ok(())
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct CpuRunResult {
     pub(crate) output: Vec<f32>,
     pub(crate) final_state: Vec<f32>,
@@ -274,6 +274,72 @@ pub(crate) fn cpu_stepwise(
     Ok(CpuRunResult {
         output,
         final_state: state,
+    })
+}
+
+/// Neutral high-precision recurrence oracle. Inputs retain their public
+/// BF16/FP32 values, all recurrence arithmetic is evaluated in FP64, and the
+/// result is rounded only once at the public FP32-state/BF16-output boundary.
+/// This is intentionally not a simulation of either Triton or WGMMA ordering.
+pub(crate) fn cpu_stepwise_f64_rounded(
+    geometry: Geometry,
+    prepared: &Prepared,
+    initial_state: &[f32],
+) -> Result<CpuRunResult, String> {
+    let expected_state = geometry.h_v * geometry.d * geometry.d;
+    if initial_state.len() != expected_state
+        || prepared.q.len() != geometry.q_len()
+        || prepared.k.len() != geometry.k_len()
+        || prepared.v.len() != geometry.v_len()
+        || prepared.alpha.len() != geometry.gate_len()
+        || prepared.beta.len() != geometry.gate_len()
+    {
+        return Err("FP64 CPU GDN reference input length mismatch".to_string());
+    }
+    if geometry.h_q != geometry.h_k || !geometry.h_v.is_multiple_of(geometry.h_k) {
+        return Err("FP64 CPU GDN reference requires Hq=Hk and Hv divisible by Hk".to_string());
+    }
+
+    let mut state: Vec<f64> = initial_state.iter().copied().map(f64::from).collect();
+    let mut output = vec![0.0_f32; geometry.v_len()];
+    let scale = 1.0_f64 / (geometry.d as f64).sqrt();
+    for token in 0..geometry.tokens {
+        for value_head in 0..geometry.h_v {
+            let key_head = value_head * geometry.h_k / geometry.h_v;
+            let q_base = (token * geometry.h_q + key_head) * geometry.d;
+            let k_base = (token * geometry.h_k + key_head) * geometry.d;
+            let v_base = (token * geometry.h_v + value_head) * geometry.d;
+            let state_base = value_head * geometry.d * geometry.d;
+            let alpha = f64::from(prepared.alpha[token * geometry.h_v + value_head]);
+            let beta = f64::from(prepared.beta[token * geometry.h_v + value_head]);
+
+            for key in 0..geometry.d {
+                let row = state_base + key * geometry.d;
+                for value in 0..geometry.d {
+                    state[row + value] *= alpha;
+                }
+            }
+
+            for value in 0..geometry.d {
+                let mut memory = 0.0_f64;
+                for key in 0..geometry.d {
+                    memory += state[state_base + key * geometry.d + value]
+                        * f64::from(bf16_to_f32(prepared.k[k_base + key]));
+                }
+                let delta = (f64::from(bf16_to_f32(prepared.v[v_base + value])) - memory) * beta;
+                let mut out = 0.0_f64;
+                for key in 0..geometry.d {
+                    let index = state_base + key * geometry.d + value;
+                    state[index] += delta * f64::from(bf16_to_f32(prepared.k[k_base + key]));
+                    out += state[index] * f64::from(bf16_to_f32(prepared.q[q_base + key])) * scale;
+                }
+                output[v_base + value] = bf16_to_f32(f32_to_bf16(out as f32));
+            }
+        }
+    }
+    Ok(CpuRunResult {
+        output,
+        final_state: state.into_iter().map(|value| value as f32).collect(),
     })
 }
 
@@ -429,10 +495,8 @@ mod tests {
 
     #[test]
     fn hv48_operator_tail_accepts_bounded_baseline_dominant_tail() {
-        // Threshold counts may flip even while the whole FlashInfer error
-        // distribution is better, so the independent count cap governs them.
-        let flashinfer = synthetic_stats(5, 0.00601, 3.57e-4, 4.30e-4, 1.95e-3);
-        let triton = synthetic_stats(2, 0.00629, 1.6e-5, 4.66e-4, 2.07e-3);
+        let flashinfer = synthetic_stats(4, 0.00514, 4.4e-5, 3.75e-4, 1.77e-3);
+        let triton = synthetic_stats(6, 0.00584, 8.0e-4, 4.41e-4, 2.00e-3);
         flashinfer
             .ensure_hv48_operator_tail_within("Hv48", &triton)
             .unwrap();
@@ -479,12 +543,15 @@ mod tests {
             beta: vec![0.25],
         };
         let result = cpu_stepwise(geometry, &prepared, &[4.0, 5.0, 6.0, 7.0]).unwrap();
+        let f64_result =
+            cpu_stepwise_f64_rounded(geometry, &prepared, &[4.0, 5.0, 6.0, 7.0]).unwrap();
         assert_eq!(result.final_state, vec![2.0, 2.625, 3.0, 3.5]);
         let expected_output = vec![
             bf16_to_f32(f32_to_bf16(2.0 / 2.0_f32.sqrt())),
             bf16_to_f32(f32_to_bf16(2.625 / 2.0_f32.sqrt())),
         ];
         assert_eq!(result.output, expected_output);
+        assert_eq!(f64_result, result);
     }
 
     #[test]
