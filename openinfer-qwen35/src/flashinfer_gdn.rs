@@ -1930,42 +1930,71 @@ mod tests {
                 "GDN smoke state did not update at T={tokens}"
             );
 
-            log_and_gate(
+            let cpu_triton_output_stats = log_difference_stats(
                 &format!("prefill CPU/Triton output Hv={h_v} T={tokens}"),
                 &cpu.output,
                 &triton_output_host,
                 RECURRENCE_OUTPUT_TOLERANCE,
             )?;
-            log_and_gate(
+            let cpu_flashinfer_output_stats = log_difference_stats(
                 &format!("prefill CPU/FlashInfer output Hv={h_v} T={tokens}"),
                 &cpu.output,
                 &alias_output,
                 RECURRENCE_OUTPUT_TOLERANCE,
             )?;
-            log_and_gate(
+            let triton_flashinfer_output_stats = log_difference_stats(
                 &format!("prefill Triton/FlashInfer output Hv={h_v} T={tokens}"),
                 &triton_output_host,
                 &alias_output,
                 RECURRENCE_OUTPUT_TOLERANCE,
             )?;
-            log_and_gate(
+            let cpu_triton_state_stats = log_difference_stats(
                 &format!("prefill CPU/Triton state Hv={h_v} T={tokens}"),
                 &cpu.final_state,
                 &triton_final,
                 RECURRENCE_STATE_TOLERANCE,
             )?;
-            log_and_gate(
+            let cpu_flashinfer_state_stats = log_difference_stats(
                 &format!("prefill CPU/FlashInfer state Hv={h_v} T={tokens}"),
                 &cpu.final_state,
                 &alias_final,
                 RECURRENCE_STATE_TOLERANCE,
             )?;
-            log_and_gate(
+            let triton_flashinfer_state_stats = log_difference_stats(
                 &format!("prefill Triton/FlashInfer state Hv={h_v} T={tokens}"),
                 &triton_final,
                 &alias_final,
                 RECURRENCE_STATE_TOLERANCE,
             )?;
+
+            for (label, stats) in [
+                (
+                    format!("prefill CPU/Triton output Hv={h_v} T={tokens}"),
+                    cpu_triton_output_stats,
+                ),
+                (
+                    format!("prefill CPU/FlashInfer output Hv={h_v} T={tokens}"),
+                    cpu_flashinfer_output_stats,
+                ),
+                (
+                    format!("prefill Triton/FlashInfer output Hv={h_v} T={tokens}"),
+                    triton_flashinfer_output_stats,
+                ),
+                (
+                    format!("prefill CPU/Triton state Hv={h_v} T={tokens}"),
+                    cpu_triton_state_stats,
+                ),
+                (
+                    format!("prefill CPU/FlashInfer state Hv={h_v} T={tokens}"),
+                    cpu_flashinfer_state_stats,
+                ),
+                (
+                    format!("prefill Triton/FlashInfer state Hv={h_v} T={tokens}"),
+                    triton_flashinfer_state_stats,
+                ),
+            ] {
+                stats.ensure_within(&label).map_err(anyhow::Error::msg)?;
+            }
 
             run_batched_decode_handoff(
                 &ctx,
