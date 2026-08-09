@@ -1184,18 +1184,20 @@ mod tests {
     use super::*;
     use crate::config::LayerType;
     use crate::gdn_prepare_test_contract::Fixture;
+    use crate::gdn_prepare_test_contract::Geometry as PrepareGeometry;
     use crate::gdn_prepare_test_contract::Prepared;
     use crate::gdn_prepare_test_contract::bf16_to_f32;
     use crate::gdn_prepare_test_contract::deterministic_fixture;
     use crate::gdn_prepare_test_contract::prepare;
     use crate::gdn_stage7_test_support::CpuRunResult;
     use crate::gdn_stage7_test_support::DifferenceStats;
+    use crate::gdn_stage7_test_support::FirstDifference;
+    use crate::gdn_stage7_test_support::NumericTolerance;
     use crate::gdn_stage7_test_support::PREPARE_GATE_TOLERANCE;
     use crate::gdn_stage7_test_support::PREPARE_QK_TOLERANCE;
     use crate::gdn_stage7_test_support::RECURRENCE_OUTPUT_TOLERANCE;
     use crate::gdn_stage7_test_support::RECURRENCE_STATE_TOLERANCE;
     use crate::gdn_stage7_test_support::asymmetric_hkv_state;
-    use crate::gdn_stage7_test_support::cpu_blockwise_final_state;
     use crate::gdn_stage7_test_support::cpu_decode_from_raw;
     use crate::gdn_stage7_test_support::cpu_stepwise;
     use crate::gdn_stage7_test_support::transpose_kv_as_wrong_hvk;
@@ -1345,6 +1347,206 @@ mod tests {
             alpha,
             beta,
         })
+    }
+
+    fn prepared_token(
+        prepared: &Prepared,
+        geometry: PrepareGeometry,
+        token: usize,
+    ) -> Result<Prepared> {
+        ensure!(token < geometry.tokens, "prepared token index out of range");
+        let q_stride = geometry.h_q * geometry.d;
+        let k_stride = geometry.h_k * geometry.d;
+        let v_stride = geometry.h_v * geometry.d;
+        let gate_stride = geometry.h_v;
+        let take =
+            |values: &[u16], stride: usize| values[token * stride..(token + 1) * stride].to_vec();
+        let take_gate =
+            |values: &[f32]| values[token * gate_stride..(token + 1) * gate_stride].to_vec();
+        Ok(Prepared {
+            q: take(&prepared.q, q_stride),
+            k: take(&prepared.k, k_stride),
+            v: take(&prepared.v, v_stride),
+            alpha: take_gate(&prepared.alpha),
+            beta: take_gate(&prepared.beta),
+        })
+    }
+
+    fn launch_flashinfer_prepared_t1(
+        ctx: &DeviceContext,
+        backend: &FlashInferGdnBackend,
+        config: &Config35,
+        prepared: &Prepared,
+        initial_state: &[f32],
+        repeats: usize,
+    ) -> Result<CpuRunResult> {
+        ensure!(repeats > 0, "T=1 diagnostic requires at least one repeat");
+        let h_q = config.linear_num_key_heads;
+        let h_k = config.linear_num_key_heads;
+        let h_v = config.linear_num_value_heads;
+        let d = config.linear_key_head_dim;
+        ensure!(
+            prepared.q.len() == h_q * d
+                && prepared.k.len() == h_k * d
+                && prepared.v.len() == h_v * d
+                && prepared.alpha.len() == h_v
+                && prepared.beta.len() == h_v,
+            "T=1 diagnostic prepared lengths do not match manifest geometry"
+        );
+
+        let mut resources = FlashInferGdnChunkResources::new(ctx, config, backend, 1)?;
+        let q: Vec<bf16> = prepared.q.iter().copied().map(bf16::from_bits).collect();
+        let k: Vec<bf16> = prepared.k.iter().copied().map(bf16::from_bits).collect();
+        let v: Vec<bf16> = prepared.v.iter().copied().map(bf16::from_bits).collect();
+        ctx.stream.memcpy_htod(&q, &mut resources.prepare.q.data)?;
+        ctx.stream.memcpy_htod(&k, &mut resources.prepare.k.data)?;
+        ctx.stream.memcpy_htod(&v, &mut resources.prepare.v.data)?;
+        ctx.stream
+            .memcpy_htod(&prepared.alpha, &mut resources.prepare.alpha)?;
+        ctx.stream
+            .memcpy_htod(&prepared.beta, &mut resources.prepare.beta)?;
+
+        let initial = ctx.stream.clone_htod(initial_state)?;
+        let mut final_state: CudaSlice<f32> = ctx.stream.alloc_zeros(initial_state.len())?;
+        let mut first: Option<CpuRunResult> = None;
+        for repeat in 0..repeats {
+            resources.launch_separate(ctx, backend, &initial, &mut final_state)?;
+            let output = resources.output.to_host(ctx)?;
+            let final_host = ctx.stream.clone_dtoh(&final_state)?;
+            ctx.sync()?;
+            let run = CpuRunResult {
+                output,
+                final_state: final_host,
+            };
+            if let Some(expected) = &first {
+                ensure!(
+                    run.output == expected.output && run.final_state == expected.final_state,
+                    "FlashInfer T=1 diagnostic was not bitwise deterministic at repeat {repeat}"
+                );
+            } else {
+                first = Some(run);
+            }
+        }
+        first.context("T=1 diagnostic did not execute")
+    }
+
+    fn violation_details(
+        reference: &[f32],
+        candidate: &[f32],
+        tolerance: NumericTolerance,
+    ) -> Vec<FirstDifference> {
+        reference
+            .iter()
+            .copied()
+            .zip(candidate.iter().copied())
+            .enumerate()
+            .filter_map(|(index, (reference, candidate))| {
+                let abs_diff = (reference - candidate).abs();
+                let allowed =
+                    tolerance.atol + tolerance.rtol * reference.abs().max(candidate.abs());
+                (abs_diff > allowed).then_some(FirstDifference {
+                    index,
+                    reference,
+                    candidate,
+                    abs_diff,
+                    allowed,
+                })
+            })
+            .collect()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn log_hv48_t65_attribution(
+        cpu_t65: &CpuRunResult,
+        flashinfer_t65_output: &[f32],
+        flashinfer_t65_state: &[f32],
+        cpu_t64_state: &[f32],
+        flashinfer_t64_state: &[f32],
+        prepared_t65: &Prepared,
+        geometry: PrepareGeometry,
+        ctx: &DeviceContext,
+        backend: &FlashInferGdnBackend,
+        config: &Config35,
+    ) -> Result<()> {
+        ensure!(geometry.tokens == 65, "Hv48 tail attribution requires T=65");
+        let tail = prepared_token(prepared_t65, geometry, 64)?;
+        let mut tail_geometry = geometry;
+        tail_geometry.tokens = 1;
+
+        let a_cpu_from_cpu =
+            cpu_stepwise(tail_geometry, &tail, cpu_t64_state).map_err(anyhow::Error::msg)?;
+        let b_cpu_from_flashinfer =
+            cpu_stepwise(tail_geometry, &tail, flashinfer_t64_state).map_err(anyhow::Error::msg)?;
+        let c_flashinfer_from_cpu =
+            launch_flashinfer_prepared_t1(ctx, backend, config, &tail, cpu_t64_state, 1)?;
+        let d_flashinfer_from_flashinfer =
+            launch_flashinfer_prepared_t1(ctx, backend, config, &tail, flashinfer_t64_state, 10)?;
+
+        let tail_output_start = 64 * geometry.h_v * geometry.d;
+        let flashinfer_t65_tail_output = &flashinfer_t65_output[tail_output_start..];
+        eprintln!(
+            "Hv48 T=65 decomposition consistency: CPU65==CPU64+CPU-T1 state={}, FlashInfer65==FlashInfer64+FlashInfer-T1 state={}, output={}, T1_repeat10=bitwise",
+            cpu_t65.final_state == a_cpu_from_cpu.final_state,
+            flashinfer_t65_state == d_flashinfer_from_flashinfer.final_state,
+            flashinfer_t65_tail_output == d_flashinfer_from_flashinfer.output,
+        );
+
+        for (label, reference, candidate) in [
+            (
+                "Hv48 T=65 prefix propagation CPU(S64_cpu)->CPU(S64_flashinfer)",
+                a_cpu_from_cpu.final_state.as_slice(),
+                b_cpu_from_flashinfer.final_state.as_slice(),
+            ),
+            (
+                "Hv48 T=65 tail path CPU-T1/FlashInfer-T1 from S64_cpu",
+                a_cpu_from_cpu.final_state.as_slice(),
+                c_flashinfer_from_cpu.final_state.as_slice(),
+            ),
+            (
+                "Hv48 T=65 composed/full FlashInfer",
+                d_flashinfer_from_flashinfer.final_state.as_slice(),
+                flashinfer_t65_state,
+            ),
+        ] {
+            log_difference_stats(label, reference, candidate, RECURRENCE_STATE_TOLERANCE)?;
+        }
+
+        let violations = violation_details(
+            &cpu_t65.final_state,
+            flashinfer_t65_state,
+            RECURRENCE_STATE_TOLERANCE,
+        );
+        eprintln!(
+            "Hv48 T=65 exact state violations: {} (printing all)",
+            violations.len()
+        );
+        for difference in violations {
+            let head_stride = geometry.d * geometry.d;
+            let head = difference.index / head_stride;
+            let remainder = difference.index % head_stride;
+            let key = remainder / geometry.d;
+            let value = remainder % geometry.d;
+            eprintln!(
+                "Hv48 T=65 violation index={} (h={head},k={key},v={value}) cpu65={} flashinfer65={} abs={} allowed={} excess={} | A_cpu64_cpu1={} B_fi64_cpu1={} C_cpu64_fi1={} D_fi64_fi1={} prefix_effect={} tail_effect={} composition_effect={}",
+                difference.index,
+                difference.reference,
+                difference.candidate,
+                difference.abs_diff,
+                difference.allowed,
+                difference.abs_diff - difference.allowed,
+                a_cpu_from_cpu.final_state[difference.index],
+                b_cpu_from_flashinfer.final_state[difference.index],
+                c_flashinfer_from_cpu.final_state[difference.index],
+                d_flashinfer_from_flashinfer.final_state[difference.index],
+                b_cpu_from_flashinfer.final_state[difference.index]
+                    - a_cpu_from_cpu.final_state[difference.index],
+                c_flashinfer_from_cpu.final_state[difference.index]
+                    - a_cpu_from_cpu.final_state[difference.index],
+                flashinfer_t65_state[difference.index]
+                    - d_flashinfer_from_flashinfer.final_state[difference.index],
+            );
+        }
+        Ok(())
     }
 
     fn run_batched_decode_handoff(
@@ -1762,6 +1964,38 @@ mod tests {
         assert_eq!(second, Some(3));
     }
 
+    #[test]
+    fn stage7_tail_diagnostic_slices_token_64_without_regenerating_fixture() {
+        let fixture = deterministic_fixture(65, 48);
+        let prepared = prepare(&fixture).unwrap();
+        let tail = prepared_token(&prepared, fixture.geometry, 64).unwrap();
+        let q_stride = fixture.geometry.h_q * fixture.geometry.d;
+        let k_stride = fixture.geometry.h_k * fixture.geometry.d;
+        let v_stride = fixture.geometry.h_v * fixture.geometry.d;
+        let gate_stride = fixture.geometry.h_v;
+        assert_eq!(tail.q, prepared.q[64 * q_stride..65 * q_stride]);
+        assert_eq!(tail.k, prepared.k[64 * k_stride..65 * k_stride]);
+        assert_eq!(tail.v, prepared.v[64 * v_stride..65 * v_stride]);
+        assert_eq!(
+            tail.alpha,
+            prepared.alpha[64 * gate_stride..65 * gate_stride]
+        );
+        assert_eq!(tail.beta, prepared.beta[64 * gate_stride..65 * gate_stride]);
+    }
+
+    #[test]
+    fn stage7_tail_diagnostic_reports_every_frozen_bound_violation() {
+        let tolerance = NumericTolerance {
+            atol: 0.1,
+            rtol: 0.0,
+        };
+        let violations = violation_details(&[0.0, 1.0, 2.0], &[0.2, 1.0, 2.3], tolerance);
+        assert_eq!(
+            violations.iter().map(|item| item.index).collect::<Vec<_>>(),
+            [0, 2]
+        );
+    }
+
     /// Complete Stage 7 operator/state gate for one manifest geometry.
     ///
     /// The runner script invokes this once with Hv32 and once with Hv48.  Each
@@ -1778,6 +2012,8 @@ mod tests {
         let backend = FlashInferGdnBackend::load(&ctx, Path::new(&manifest))?;
         let config = candidate_config(usize::try_from(backend.geometry().h_v)?);
         let state_len = state_elements(backend.geometry())?;
+        let mut cpu_t64_state = None;
+        let mut flashinfer_t64_state = None;
 
         for tokens in [1_usize, 2, 63, 64, 65, 127, 128] {
             let mut resources = FlashInferGdnChunkResources::new(&ctx, &config, &backend, tokens)?;
@@ -2014,43 +2250,24 @@ mod tests {
                 RECURRENCE_STATE_TOLERANCE,
             )?;
 
-            // FlashInfer's SM120 recurrence is algebraically equivalent to
-            // the token-wise CPU oracle, but its 64-token path has additional
-            // FP16/BF16 boundaries around the triangular inverse, state/SK,
-            // residual, T, and decayed NewV operands.  If the future Hv48
-            // specialization crosses the fixed state tolerance against the
-            // semantic stepwise oracle, require it to pass the separately
-            // frozen kernel-dataflow mirror with the exact same tolerance.
-            // Stepwise statistics remain visible and no tolerance changes.
-            let mut blockwise_handoff_state = None;
-            let (cpu_flashinfer_state_gate_label, cpu_flashinfer_state_gate_stats) =
-                if h_v == 48 && cpu_flashinfer_state_stats.violations > 0 {
-                    let blockwise_state =
-                        cpu_blockwise_final_state(fixture.geometry, &actual_prepare, &initial_host)
-                            .map_err(anyhow::Error::msg)?;
-                    log_difference_stats(
-                        &format!("prefill CPU-stepwise/blockwise state Hv={h_v} T={tokens}"),
-                        &cpu.final_state,
-                        &blockwise_state,
-                        RECURRENCE_STATE_TOLERANCE,
-                    )?;
-                    let stats = log_difference_stats(
-                        &format!("prefill CPU-blockwise/FlashInfer state Hv={h_v} T={tokens}"),
-                        &blockwise_state,
-                        &alias_final,
-                        RECURRENCE_STATE_TOLERANCE,
-                    )?;
-                    blockwise_handoff_state = Some(blockwise_state);
-                    (
-                        format!("prefill CPU-blockwise/FlashInfer state Hv={h_v} T={tokens}"),
-                        stats,
-                    )
-                } else {
-                    (
-                        format!("prefill CPU/FlashInfer state Hv={h_v} T={tokens}"),
-                        cpu_flashinfer_state_stats,
-                    )
-                };
+            if h_v == 48 && tokens == 65 && cpu_flashinfer_state_stats.violations > 0 {
+                log_hv48_t65_attribution(
+                    &cpu,
+                    &alias_output,
+                    &alias_final,
+                    cpu_t64_state
+                        .as_deref()
+                        .context("Hv48 T=65 diagnostic is missing CPU T=64 state")?,
+                    flashinfer_t64_state
+                        .as_deref()
+                        .context("Hv48 T=65 diagnostic is missing FlashInfer T=64 state")?,
+                    &actual_prepare,
+                    fixture.geometry,
+                    &ctx,
+                    &backend,
+                    &config,
+                )?;
+            }
 
             for (label, stats) in [
                 (
@@ -2058,8 +2275,8 @@ mod tests {
                     cpu_flashinfer_output_stats,
                 ),
                 (
-                    cpu_flashinfer_state_gate_label,
-                    cpu_flashinfer_state_gate_stats,
+                    format!("prefill CPU/FlashInfer state Hv={h_v} T={tokens}"),
+                    cpu_flashinfer_state_stats,
                 ),
             ] {
                 stats.ensure_within(&label).map_err(anyhow::Error::msg)?;
@@ -2095,20 +2312,19 @@ mod tests {
                 }
             }
 
-            let blockwise_handoff = blockwise_handoff_state.map(|final_state| CpuRunResult {
-                output: cpu.output.clone(),
-                final_state,
-            });
-            let cpu_for_handoff = blockwise_handoff.as_ref().unwrap_or(&cpu);
             run_batched_decode_handoff(
                 &ctx,
                 h_v,
-                cpu_for_handoff,
+                &cpu,
                 &mut triton_state,
                 &mut alias_state,
                 tokens,
                 gate_triton_baseline,
             )?;
+            if h_v == 48 && tokens == 64 {
+                cpu_t64_state = Some(cpu.final_state.clone());
+                flashinfer_t64_state = Some(alias_final);
+            }
         }
         Ok(())
     }
