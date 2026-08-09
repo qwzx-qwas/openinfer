@@ -628,6 +628,14 @@ impl TmaSwizzle {
             Self::B128 => 64,
         }
     }
+
+    const fn box_dimensions(self) -> [u32; 3] {
+        // The PTX addresses every tensor map as `[D,T,H]`.  One TMA
+        // operation spans part of D and one 64-token tile while remaining on
+        // exactly one head.  Keeping the old `[D,H,T]` tile order here would
+        // make independent head CTAs overlap the same TMA region.
+        [self.inner_box_elements(), TMA_TILE_TOKENS, 1]
+    }
 }
 
 fn tma_global_layout(tokens: u32, heads: u32) -> ([u64; 3], [u64; 2]) {
@@ -667,7 +675,7 @@ fn encode_tma_descriptor(
     // MN_SW32 covers it with eight 16-BF16 operations.  `boxDim[0]` is the
     // inner dimension of one operation, not the full logical head dimension.
     // CUDA rejects an inner box wider than the selected swizzle span.
-    let box_dimensions = [swizzle.inner_box_elements(), 1, TMA_TILE_TOKENS];
+    let box_dimensions = swizzle.box_dimensions();
     let element_strides = [1_u32, 1, 1];
     let mut descriptor = TmaDescriptor { opaque: [0; 16] };
     let cuda_swizzle = match swizzle {
@@ -1264,10 +1272,20 @@ mod tests {
         candidate: &[f32],
         tolerance: crate::gdn_stage7_test_support::NumericTolerance,
     ) -> Result<DifferenceStats> {
+        let stats = log_difference_stats(label, reference, candidate, tolerance)?;
+        stats.ensure_within(label).map_err(anyhow::Error::msg)?;
+        Ok(stats)
+    }
+
+    fn log_difference_stats(
+        label: &str,
+        reference: &[f32],
+        candidate: &[f32],
+        tolerance: crate::gdn_stage7_test_support::NumericTolerance,
+    ) -> Result<DifferenceStats> {
         let stats = DifferenceStats::compare(reference, candidate, tolerance)
             .map_err(anyhow::Error::msg)?;
         eprintln!("{label}: {stats:?}");
-        stats.ensure_within(label).map_err(anyhow::Error::msg)?;
         Ok(stats)
     }
 
@@ -1550,6 +1568,8 @@ mod tests {
         assert_eq!(TmaSwizzle::B32.inner_box_elements() * bf16_bytes, 32);
         assert_eq!(128 % TmaSwizzle::B128.inner_box_elements(), 0);
         assert_eq!(128 % TmaSwizzle::B32.inner_box_elements(), 0);
+        assert_eq!(TmaSwizzle::B128.box_dimensions(), [64, 64, 1]);
+        assert_eq!(TmaSwizzle::B32.box_dimensions(), [16, 64, 1]);
     }
 
     #[test]
@@ -1826,13 +1846,80 @@ mod tests {
                     && separate_final.iter().all(|value| value.is_finite()),
                 "non-finite GDN smoke output at T={tokens}"
             );
+            let alias_separate_output_stats = log_difference_stats(
+                &format!("prefill alias/separate output Hv={h_v} T={tokens}"),
+                &separate_output,
+                &alias_output,
+                RECURRENCE_OUTPUT_TOLERANCE,
+            )?;
+            let alias_separate_state_stats = log_difference_stats(
+                &format!("prefill alias/separate state Hv={h_v} T={tokens}"),
+                &separate_final,
+                &alias_final,
+                RECURRENCE_STATE_TOLERANCE,
+            )?;
+            if alias_output != separate_output || alias_final != separate_final {
+                // The exact-alias gate is deliberately bitwise.  When it
+                // fails, print both paths against the independent CPU and
+                // Triton oracles before returning so a paid GPU rerun tells
+                // us which state mode is wrong instead of only reporting that
+                // the two modes differ.
+                log_difference_stats(
+                    &format!("diagnostic CPU/alias output Hv={h_v} T={tokens}"),
+                    &cpu.output,
+                    &alias_output,
+                    RECURRENCE_OUTPUT_TOLERANCE,
+                )?;
+                log_difference_stats(
+                    &format!("diagnostic CPU/separate output Hv={h_v} T={tokens}"),
+                    &cpu.output,
+                    &separate_output,
+                    RECURRENCE_OUTPUT_TOLERANCE,
+                )?;
+                log_difference_stats(
+                    &format!("diagnostic Triton/alias output Hv={h_v} T={tokens}"),
+                    &triton_output_host,
+                    &alias_output,
+                    RECURRENCE_OUTPUT_TOLERANCE,
+                )?;
+                log_difference_stats(
+                    &format!("diagnostic Triton/separate output Hv={h_v} T={tokens}"),
+                    &triton_output_host,
+                    &separate_output,
+                    RECURRENCE_OUTPUT_TOLERANCE,
+                )?;
+                log_difference_stats(
+                    &format!("diagnostic CPU/alias state Hv={h_v} T={tokens}"),
+                    &cpu.final_state,
+                    &alias_final,
+                    RECURRENCE_STATE_TOLERANCE,
+                )?;
+                log_difference_stats(
+                    &format!("diagnostic CPU/separate state Hv={h_v} T={tokens}"),
+                    &cpu.final_state,
+                    &separate_final,
+                    RECURRENCE_STATE_TOLERANCE,
+                )?;
+                log_difference_stats(
+                    &format!("diagnostic Triton/alias state Hv={h_v} T={tokens}"),
+                    &triton_final,
+                    &alias_final,
+                    RECURRENCE_STATE_TOLERANCE,
+                )?;
+                log_difference_stats(
+                    &format!("diagnostic Triton/separate state Hv={h_v} T={tokens}"),
+                    &triton_final,
+                    &separate_final,
+                    RECURRENCE_STATE_TOLERANCE,
+                )?;
+            }
             ensure!(
                 alias_output == separate_output,
-                "alias/separate GDN outputs differ at T={tokens}"
+                "alias/separate GDN outputs differ at Hv={h_v}, T={tokens}: {alias_separate_output_stats:?}"
             );
             ensure!(
                 alias_final == separate_final,
-                "alias/separate GDN final states differ at T={tokens}"
+                "alias/separate GDN final states differ at Hv={h_v}, T={tokens}: {alias_separate_state_stats:?}"
             );
             ensure!(
                 alias_output.iter().any(|&value| value != 0.0),
