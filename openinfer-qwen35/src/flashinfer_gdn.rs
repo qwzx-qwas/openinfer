@@ -51,6 +51,14 @@ const PATCH_SET_SHA256: &str = "fbb15a0135095a3576d9c6439c0496bda5361d2af3602800
 const REQUIREMENTS_LOCK_SHA256: &str =
     "2051b988e4ff3213f5115c688239d1271ea100f43646fa476e0148ed020a5a3f";
 const GENERATOR_SHA256: &str = "1973974a91749e45e1bfcb7861d383e6b4c2a5940b4e777108fe3a17889499c7";
+#[cfg(test)]
+const UPSTREAM_HVK_GENERATOR_SHA256: &str =
+    "beadbd7c7e968c81104518fe67530b0919ca395f2ba2a96467e42723b31c8857";
+#[cfg(test)]
+const UPSTREAM_HVK_KERNEL_SOURCE_SHA256: &str =
+    "dafd93ceeafeee0ac024a8405f40da69edae33b7f99fc6b97f670b41a85e8cc6";
+#[cfg(test)]
+const ZERO_SHA256: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 const ENTRY_SYMBOL: &str = "kernel_cutlass_kernel_flashinfergdn_kernelsdelta_rule_dsldelta_rule_sm120_FullyFusedDeltaRuleSm120_object_at__tensorptrf32gmemalign16o1_tensorptrf32gmemalign16o1_CopyAtom_ThrID10_TVLayout_0";
 const ARTIFACT_SHA256: &str = "225646b26dab488cdfd64dcf3fe189ba4b7ccaf2ba735eb7b68a47d13db96b68";
 const ARTIFACT_SIZE_BYTES: u64 = 549_690;
@@ -249,6 +257,19 @@ impl FlashInferGdnBackend {
     /// Load a pinned artifact into this model's CUDA context. This API remains
     /// crate-private until the GPU gates and full prefill integration pass.
     pub(super) fn load(ctx: &DeviceContext, manifest_path: &Path) -> Result<Self> {
+        let (creation_context, sm_count) = Self::validate_load_context(ctx)?;
+        let (artifact, ptx) = load_and_validate_artifact(manifest_path)?;
+        Self::load_validated(ctx, artifact, ptx, creation_context, sm_count)
+    }
+
+    #[cfg(test)]
+    fn load_stage7_upstream_hvk(ctx: &DeviceContext, manifest_path: &Path) -> Result<Self> {
+        let (creation_context, sm_count) = Self::validate_load_context(ctx)?;
+        let (artifact, ptx) = load_and_validate_upstream_hvk_artifact(manifest_path)?;
+        Self::load_validated(ctx, artifact, ptx, creation_context, sm_count)
+    }
+
+    fn validate_load_context(ctx: &DeviceContext) -> Result<(usize, u32)> {
         let (major, minor) = ctx.ctx.compute_capability()?;
         ensure!(
             (major, minor) == (12, 0),
@@ -263,8 +284,21 @@ impl FlashInferGdnBackend {
             creation_context == expected_context,
             "CUDA current-context mismatch while loading GDN artifact: expected {expected_context:#x}, got {creation_context:#x}"
         );
+        let sm_count =
+            u32::try_from(ctx.ctx.attribute(
+                sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
+            )?)
+            .context("negative CUDA multiprocessor count")?;
+        Ok((creation_context, sm_count))
+    }
 
-        let (artifact, ptx) = load_and_validate_artifact(manifest_path)?;
+    fn load_validated(
+        ctx: &DeviceContext,
+        artifact: ValidatedArtifact,
+        ptx: String,
+        creation_context: usize,
+        sm_count: u32,
+    ) -> Result<Self> {
         let module = ctx.ctx.load_module(Ptx::from_src(ptx))?;
         let function = module
             .load_function(&artifact.entry_symbol)
@@ -278,12 +312,6 @@ impl FlashInferGdnBackend {
             function.max_threads_per_block()? >= THREADS_PER_BLOCK as i32,
             "GDN artifact cannot launch its frozen {THREADS_PER_BLOCK}-thread block"
         );
-        let sm_count =
-            u32::try_from(ctx.ctx.attribute(
-                sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
-            )?)
-            .context("negative CUDA multiprocessor count")?;
-
         Ok(Self {
             function,
             artifact,
@@ -794,6 +822,165 @@ fn load_and_validate_artifact(manifest_path: &Path) -> Result<(ValidatedArtifact
         ptx.contains(&format!(".entry {}(", manifest.abi.entry_symbol)),
         "GDN PTX does not define manifest entry symbol {}",
         manifest.abi.entry_symbol
+    );
+    validate_ptx_launch_abi(&ptx)?;
+    let ptx = normalize_ptx_for_driver(ptx)?;
+
+    Ok((
+        ValidatedArtifact {
+            manifest_path: manifest_path.to_owned(),
+            ptx_path,
+            geometry: manifest.geometry,
+            variant: manifest.variant,
+            entry_symbol: manifest.abi.entry_symbol,
+            workspace_bytes_per_sm: manifest.workspace.bytes_per_sm,
+            workspace_alignment: manifest.workspace.alignment_bytes,
+        },
+        ptx,
+    ))
+}
+
+/// Load the frozen *unpatched* upstream HVK artifact for the Stage 7 A/B.
+///
+/// This path exists only in the unit-test build. It deliberately has a
+/// separate manifest contract, cannot be installed on a model, and is never
+/// eligible for production dispatch. The PTX hash is self-consistent with the
+/// manifest because this diagnostic artifact is generated on the GPU host;
+/// source, generator, requirements, geometry, layout, and launch ABI remain
+/// independently pinned here.
+#[cfg(test)]
+fn load_and_validate_upstream_hvk_artifact(
+    manifest_path: &Path,
+) -> Result<(ValidatedArtifact, String)> {
+    let bytes = fs::read(manifest_path).with_context(|| {
+        format!(
+            "read Stage 7 upstream-HVK GDN manifest {}",
+            manifest_path.display()
+        )
+    })?;
+    let manifest: Manifest = serde_json::from_slice(&bytes).with_context(|| {
+        format!(
+            "parse Stage 7 upstream-HVK GDN manifest {}",
+            manifest_path.display()
+        )
+    })?;
+
+    ensure!(
+        manifest.schema_version == SCHEMA_VERSION,
+        "upstream-HVK schema mismatch"
+    );
+    ensure!(
+        manifest.artifact_kind == ARTIFACT_KIND,
+        "upstream-HVK artifact kind mismatch"
+    );
+    ensure!(
+        manifest.variant == "operator_hv48"
+            && manifest.geometry
+                == (Geometry {
+                    h_q: 16,
+                    h_k: 16,
+                    h_v: 48,
+                    head_dim: 128,
+                }),
+        "upstream-HVK diagnostic only accepts the Hv48 geometry"
+    );
+    ensure!(
+        manifest.target.arch == TARGET_ARCH
+            && manifest.target.driver_jit_target == DRIVER_JIT_TARGET,
+        "upstream-HVK target mismatch"
+    );
+    ensure!(
+        manifest.source.flashinfer_commit == FLASHINFER_COMMIT,
+        "upstream-HVK FlashInfer commit mismatch"
+    );
+    ensure!(
+        !manifest.source.hkv_state_index_patch_applied
+            && manifest.source.hkv_state_index_patch_sha256 == ZERO_SHA256
+            && manifest.source.patch_set_sha256 == ZERO_SHA256,
+        "upstream-HVK diagnostic must be generated from the unpatched source"
+    );
+    ensure!(
+        manifest.source.kernel_source_sha256 == UPSTREAM_HVK_KERNEL_SOURCE_SHA256,
+        "upstream-HVK source hash mismatch"
+    );
+    ensure!(
+        manifest.source.generator_sha256 == UPSTREAM_HVK_GENERATOR_SHA256,
+        "upstream-HVK diagnostic generator hash mismatch"
+    );
+    ensure!(
+        manifest.source.requirements_lock_sha256 == REQUIREMENTS_LOCK_SHA256,
+        "upstream-HVK requirements hash mismatch"
+    );
+    ensure!(
+        manifest.abi.state_layout == "upstream_hvk_k_contiguous",
+        "upstream-HVK state layout mismatch"
+    );
+    ensure!(
+        manifest.abi.geometry_binding == "manifest_guarded_runtime_head_parameters",
+        "upstream-HVK geometry binding mismatch"
+    );
+    ensure!(
+        manifest.tokens.extent == json!("dynamic")
+            && manifest.tokens.minimum == 1
+            && manifest.tokens.divisibility == 1,
+        "upstream-HVK token contract mismatch"
+    );
+    let expected_dtypes = BTreeMap::from([
+        ("alpha".into(), "float32".into()),
+        ("beta".into(), "float32".into()),
+        ("cu_seqlens".into(), "int64".into()),
+        ("k".into(), "bfloat16".into()),
+        ("o".into(), "bfloat16".into()),
+        ("q".into(), "bfloat16".into()),
+        ("state".into(), "float32".into()),
+        ("v".into(), "bfloat16".into()),
+        ("workspace".into(), "uint8".into()),
+    ]);
+    ensure!(
+        manifest.dtypes == expected_dtypes,
+        "upstream-HVK dtype contract mismatch"
+    );
+    validate_views(&manifest)?;
+    ensure!(
+        manifest.workspace.kind == "per_sm"
+            && manifest.workspace.formula == "sm_count * bytes_per_sm"
+            && manifest.workspace.bytes_per_sm == WORKSPACE_BYTES_PER_SM
+            && manifest.workspace.alignment_bytes == WORKSPACE_ALIGNMENT,
+        "upstream-HVK workspace contract mismatch"
+    );
+    ensure!(
+        manifest.artifact.format == "ptx"
+            && manifest.artifact.file == "kernel.ptx"
+            && manifest.artifact.entry_symbols == [manifest.abi.entry_symbol.clone()]
+            && manifest.artifact.absolute_path_scan == "passed",
+        "upstream-HVK artifact metadata mismatch"
+    );
+    ensure!(
+        manifest.distribution.cuda_driver_jit_required
+            && !manifest.distribution.serving_requires_cute_dsl
+            && !manifest.distribution.serving_requires_python
+            && !manifest.distribution.production_eligible,
+        "upstream-HVK artifact must remain diagnostic-only"
+    );
+
+    let parent = manifest_path
+        .parent()
+        .context("upstream-HVK manifest path has no parent")?;
+    let ptx_path = parent.join("kernel.ptx");
+    let ptx_bytes = fs::read(&ptx_path)
+        .with_context(|| format!("read upstream-HVK PTX {}", ptx_path.display()))?;
+    ensure!(
+        ptx_bytes.len() as u64 == manifest.artifact.size_bytes,
+        "upstream-HVK PTX size mismatch"
+    );
+    ensure!(
+        hex_sha256(&ptx_bytes) == manifest.artifact.sha256,
+        "upstream-HVK PTX SHA-256 mismatch"
+    );
+    let ptx = String::from_utf8(ptx_bytes).context("upstream-HVK artifact is not UTF-8 PTX")?;
+    ensure!(
+        ptx.contains(&format!(".entry {}(", manifest.abi.entry_symbol)),
+        "upstream-HVK PTX does not define its manifest entry symbol"
     );
     validate_ptx_launch_abi(&ptx)?;
     let ptx = normalize_ptx_for_driver(ptx)?;
@@ -1615,6 +1802,109 @@ mod tests {
         Ok(())
     }
 
+    fn log_hv48_upstream_hvk_ab(
+        cpu: &CpuRunResult,
+        cpu_f64: &CpuRunResult,
+        patched_output: &[f32],
+        patched_state: &[f32],
+        prepared: &Prepared,
+        geometry: PrepareGeometry,
+        initial_hkv: &[f32],
+        ctx: &DeviceContext,
+        upstream_backend: &FlashInferGdnBackend,
+        config: &Config35,
+    ) -> Result<()> {
+        ensure!(
+            geometry.tokens == 128 && geometry.h_v == 48,
+            "upstream-HVK A/B is frozen to Hv48 T=128"
+        );
+        let initial_upstream_hvk = transpose_kv_as_wrong_hvk(geometry, initial_hkv);
+        let upstream_hvk = launch_flashinfer_prepared(
+            ctx,
+            upstream_backend,
+            config,
+            prepared,
+            geometry.tokens,
+            &initial_upstream_hvk,
+            3,
+        )?;
+        // The upstream state layout is [H,V,K] with K contiguous. Transpose
+        // each head back to OpenInfer [H,K,V] before any numeric comparison.
+        let upstream_state_hkv = transpose_kv_as_wrong_hvk(geometry, &upstream_hvk.final_state);
+
+        let cpu_upstream_output = log_difference_stats(
+            "Hv48 T=128 CPU/upstream-HVK output",
+            &cpu.output,
+            &upstream_hvk.output,
+            RECURRENCE_OUTPUT_TOLERANCE,
+        )?;
+        let cpu_upstream_state = log_difference_stats(
+            "Hv48 T=128 CPU/upstream-HVK state",
+            &cpu.final_state,
+            &upstream_state_hkv,
+            RECURRENCE_STATE_TOLERANCE,
+        )?;
+        let fp64_upstream_state = log_difference_stats(
+            "Hv48 T=128 FP64-rounded/upstream-HVK state",
+            &cpu_f64.final_state,
+            &upstream_state_hkv,
+            RECURRENCE_STATE_TOLERANCE,
+        )?;
+        let patched_upstream_output = log_difference_stats(
+            "Hv48 T=128 patched-HKV/upstream-HVK output",
+            patched_output,
+            &upstream_hvk.output,
+            RECURRENCE_OUTPUT_TOLERANCE,
+        )?;
+        let patched_upstream_state = log_difference_stats(
+            "Hv48 T=128 patched-HKV/upstream-HVK state",
+            patched_state,
+            &upstream_state_hkv,
+            RECURRENCE_STATE_TOLERANCE,
+        )?;
+        log_state_violation_details(
+            "Hv48 T=128 FP64-rounded/upstream-HVK state",
+            &cpu_f64.final_state,
+            &upstream_state_hkv,
+            geometry,
+        );
+
+        let patched_violations = violation_details(
+            &cpu_f64.final_state,
+            patched_state,
+            RECURRENCE_STATE_TOLERANCE,
+        );
+        eprintln!(
+            "Hv48 T=128 upstream-HVK A/B: patched/upstream output_bitwise={}, state_bitwise={}, patched_violations={}, upstream_violations={}",
+            patched_output == upstream_hvk.output,
+            patched_state == upstream_state_hkv,
+            patched_violations.len(),
+            fp64_upstream_state.violations,
+        );
+        for difference in patched_violations {
+            let head_stride = geometry.d * geometry.d;
+            let head = difference.index / head_stride;
+            let remainder = difference.index % head_stride;
+            let key = remainder / geometry.d;
+            let value = remainder % geometry.d;
+            let upstream = upstream_state_hkv[difference.index];
+            eprintln!(
+                "Hv48 T=128 patched violation upstream-HVK index={} (h={head},k={key},v={value}) fp64={} patched={} upstream={} patched_abs={} upstream_abs={} patched_upstream_delta={}",
+                difference.index,
+                difference.reference,
+                difference.candidate,
+                upstream,
+                difference.abs_diff,
+                (difference.reference - upstream).abs(),
+                difference.candidate - upstream,
+            );
+        }
+        eprintln!(
+            "Hv48 T=128 upstream-HVK A/B summary: CPU/upstream output={cpu_upstream_output:?}; CPU/upstream state={cpu_upstream_state:?}; patched/upstream output={patched_upstream_output:?}; patched/upstream state={patched_upstream_state:?}"
+        );
+        Ok(())
+    }
+
     fn run_batched_decode_handoff(
         ctx: &DeviceContext,
         h_v: usize,
@@ -2102,6 +2392,13 @@ mod tests {
         let ctx = DeviceContext::new()?;
         let backend = FlashInferGdnBackend::load(&ctx, Path::new(&manifest))?;
         let config = candidate_config(usize::try_from(backend.geometry().h_v)?);
+        let upstream_hvk_backend = if backend.geometry().h_v == 48 {
+            std::env::var_os("OPENINFER_GDN_UPSTREAM_HVK_MANIFEST")
+                .map(|path| FlashInferGdnBackend::load_stage7_upstream_hvk(&ctx, Path::new(&path)))
+                .transpose()?
+        } else {
+            None
+        };
         let state_len = state_elements(backend.geometry())?;
         let mut cpu_t64_state = None;
         let mut flashinfer_t64_state = None;
@@ -2412,6 +2709,29 @@ mod tests {
                     &alias_final,
                     fixture.geometry,
                 );
+            }
+
+            if h_v == 48 && tokens == 128 {
+                if let Some(upstream_backend) = &upstream_hvk_backend {
+                    log_hv48_upstream_hvk_ab(
+                        &cpu,
+                        cpu_f64
+                            .as_ref()
+                            .context("Hv48 upstream-HVK A/B requires the FP64 oracle")?,
+                        &alias_output,
+                        &alias_final,
+                        &actual_prepare,
+                        fixture.geometry,
+                        &initial_host,
+                        &ctx,
+                        upstream_backend,
+                        &config,
+                    )?;
+                } else {
+                    eprintln!(
+                        "Hv48 T=128 upstream-HVK A/B skipped: set OPENINFER_GDN_UPSTREAM_HVK_MANIFEST"
+                    );
+                }
             }
 
             if h_v == 48 && matches!(tokens, 65 | 128) && cpu_flashinfer_state_stats.violations > 0
