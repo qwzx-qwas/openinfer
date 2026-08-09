@@ -1295,7 +1295,7 @@ mod tests {
         expected: &Prepared,
         tokens: usize,
         h_v: usize,
-    ) -> Result<()> {
+    ) -> Result<Prepared> {
         resources.ensure_prepare_inputs_finite(ctx)?;
         let q = ctx.stream.clone_dtoh(&resources.prepare.q.data)?;
         let k = ctx.stream.clone_dtoh(&resources.prepare.k.data)?;
@@ -1304,24 +1304,25 @@ mod tests {
         let beta = ctx.stream.clone_dtoh(&resources.prepare.beta)?;
         ctx.sync()?;
 
-        let q: Vec<f32> = q.iter().map(|value| value.to_f32()).collect();
-        let k: Vec<f32> = k.iter().map(|value| value.to_f32()).collect();
+        let q_bits: Vec<u16> = q.iter().map(|value| value.to_bits()).collect();
+        let k_bits: Vec<u16> = k.iter().map(|value| value.to_bits()).collect();
+        let v_bits: Vec<u16> = v.iter().map(|value| value.to_bits()).collect();
+        let q_f32: Vec<f32> = q.iter().map(|value| value.to_f32()).collect();
+        let k_f32: Vec<f32> = k.iter().map(|value| value.to_f32()).collect();
         log_and_gate(
             &format!("prepare.q Hv={h_v} T={tokens}"),
             &f32_from_bits(&expected.q),
-            &q,
+            &q_f32,
             PREPARE_QK_TOLERANCE,
         )?;
         log_and_gate(
             &format!("prepare.k Hv={h_v} T={tokens}"),
             &f32_from_bits(&expected.k),
-            &k,
+            &k_f32,
             PREPARE_QK_TOLERANCE,
         )?;
         ensure!(
-            v.iter()
-                .map(|value| value.to_bits())
-                .eq(expected.v.iter().copied()),
+            v_bits == expected.v,
             "prepare.v must preserve BF16 bits exactly at Hv={h_v}, T={tokens}"
         );
         log_and_gate(
@@ -1336,7 +1337,13 @@ mod tests {
             &beta,
             PREPARE_GATE_TOLERANCE,
         )?;
-        Ok(())
+        Ok(Prepared {
+            q: q_bits,
+            k: k_bits,
+            v: v_bits,
+            alpha,
+            beta,
+        })
     }
 
     fn run_batched_decode_handoff(
@@ -1799,18 +1806,21 @@ mod tests {
                 h_v,
                 head_dim,
             )?;
-            validate_gpu_prepare(&ctx, &resources, &expected_prepare, tokens, h_v)?;
+            // Replay the verified native prepare outputs in the CPU recurrence so
+            // the oracle and FlashInfer consume bit-identical prepared inputs.
+            let actual_prepare =
+                validate_gpu_prepare(&ctx, &resources, &expected_prepare, tokens, h_v)?;
 
             let initial_host = asymmetric_hkv_state(fixture.geometry);
             ensure!(
                 initial_host.len() == state_len,
                 "Stage 7 state length mismatch"
             );
-            let cpu = cpu_stepwise(fixture.geometry, &expected_prepare, &initial_host)
+            let cpu = cpu_stepwise(fixture.geometry, &actual_prepare, &initial_host)
                 .map_err(anyhow::Error::msg)?;
             if tokens == 1 {
                 let wrong_hvk = transpose_kv_as_wrong_hvk(fixture.geometry, &initial_host);
-                let wrong_cpu = cpu_stepwise(fixture.geometry, &expected_prepare, &wrong_hvk)
+                let wrong_cpu = cpu_stepwise(fixture.geometry, &actual_prepare, &wrong_hvk)
                     .map_err(anyhow::Error::msg)?;
                 let wrong_output = DifferenceStats::compare(
                     &cpu.output,
