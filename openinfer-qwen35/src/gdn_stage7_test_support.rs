@@ -4,6 +4,8 @@
 //! changed through a serving or test environment variable during a paid GPU
 //! session.
 
+use half::f16;
+
 use crate::gdn_prepare_test_contract::Fixture;
 use crate::gdn_prepare_test_contract::Geometry;
 use crate::gdn_prepare_test_contract::Prepared;
@@ -224,13 +226,95 @@ pub(crate) fn cpu_stepwise(
     })
 }
 
-/// Frozen CPU mirror of FlashInfer's 64-token blockwise final-state path.
+fn round_to_bf16(value: f32) -> f32 {
+    bf16_to_f32(f32_to_bf16(value))
+}
+
+fn round_to_f16(value: f32) -> f32 {
+    f16::from_f32(value).to_f32()
+}
+
+fn matmul_square(left: &[f32], right: &[f32], size: usize) -> Vec<f32> {
+    let mut output = vec![0.0_f32; size * size];
+    for row in 0..size {
+        for col in 0..size {
+            let mut value = 0.0_f32;
+            for inner in 0..size {
+                value += left[row * size + inner] * right[inner * size + col];
+            }
+            output[row * size + col] = value;
+        }
+    }
+    output
+}
+
+/// Mirror FlashInfer's hierarchical FP16 `CollectiveInverse` for a unit
+/// lower-triangular matrix.  Every level writes its inverse back to FP16, and
+/// the off-diagonal block has an additional FP16 boundary between its two
+/// HMMA products.
+fn flashinfer_unit_lower_inverse(strict_lower_f16: &[f32], size: usize) -> Vec<f32> {
+    debug_assert!(size.is_power_of_two() && size >= 8);
+    debug_assert_eq!(strict_lower_f16.len(), size * size);
+
+    if size == 8 {
+        let mut inverse = vec![0.0_f32; size * size];
+        for row in 0..size {
+            inverse[row * size + row] = 1.0;
+            for col in 0..row {
+                let mut value = 0.0_f32;
+                for inner in col..row {
+                    value -= strict_lower_f16[row * size + inner] * inverse[inner * size + col];
+                }
+                inverse[row * size + col] = value;
+            }
+        }
+        for value in &mut inverse {
+            *value = round_to_f16(*value);
+        }
+        return inverse;
+    }
+
+    let half = size / 2;
+    let mut a = vec![0.0_f32; half * half];
+    let mut c = vec![0.0_f32; half * half];
+    let mut d = vec![0.0_f32; half * half];
+    for row in 0..half {
+        for col in 0..half {
+            a[row * half + col] = strict_lower_f16[row * size + col];
+            c[row * half + col] = strict_lower_f16[(row + half) * size + col];
+            d[row * half + col] = strict_lower_f16[(row + half) * size + col + half];
+        }
+    }
+    let a_inverse = flashinfer_unit_lower_inverse(&a, half);
+    let d_inverse = flashinfer_unit_lower_inverse(&d, half);
+
+    let mut d_inverse_c = matmul_square(&d_inverse, &c, half);
+    for value in &mut d_inverse_c {
+        *value = round_to_f16(-*value);
+    }
+    let mut lower_inverse = matmul_square(&d_inverse_c, &a_inverse, half);
+    for value in &mut lower_inverse {
+        *value = round_to_f16(*value);
+    }
+
+    let mut inverse = vec![0.0_f32; size * size];
+    for row in 0..half {
+        for col in 0..half {
+            inverse[row * size + col] = a_inverse[row * half + col];
+            inverse[(row + half) * size + col] = lower_inverse[row * half + col];
+            inverse[(row + half) * size + col + half] = d_inverse[row * half + col];
+        }
+    }
+    inverse
+}
+
+/// Frozen CPU mirror of FlashInfer's 64-token SM120 final-state dataflow.
 ///
-/// The semantic stepwise oracle above remains the primary reference.  This
-/// mirror is used when the SM120 implementation's BF16 block intermediates
-/// cross the fixed state tolerance against the stepwise recurrence.  It ports
-/// the locked FlashInfer reference's `IKK -> T -> u/w/new_v -> state` sequence:
-/// `T` is rounded to BF16, while the running state remains FP32.
+/// The semantic stepwise oracle remains the primary reference.  This mirror
+/// additionally preserves the locked kernel's numeric boundaries: log2/exp2
+/// alpha processing, FP16 hierarchical triangular inversion, BF16 T, BF16
+/// state operands for SK, BF16 `(V-SK)`, and BF16 decayed NewV before the
+/// final FP32-accumulating state GEMM.
 pub(crate) fn cpu_blockwise_final_state(
     geometry: Geometry,
     prepared: &Prepared,
@@ -260,11 +344,11 @@ pub(crate) fn cpu_blockwise_final_state(
         let state_base = value_head * d * d;
         for block_start in (0..geometry.tokens).step_by(BLOCK_SIZE) {
             let block_len = (geometry.tokens - block_start).min(BLOCK_SIZE);
-            let mut k = vec![0.0_f32; block_len * d];
-            let mut v = vec![0.0_f32; block_len * d];
-            let mut gamma = vec![0.0_f32; block_len];
-            let mut beta = vec![0.0_f32; block_len];
-            let mut cumulative_gamma = 0.0_f32;
+            let mut k = vec![0.0_f32; BLOCK_SIZE * d];
+            let mut v = vec![0.0_f32; BLOCK_SIZE * d];
+            let mut gamma_log2 = vec![0.0_f32; BLOCK_SIZE];
+            let mut beta = vec![0.0_f32; BLOCK_SIZE];
+            let mut cumulative_gamma_log2 = 0.0_f32;
             for token_in_block in 0..block_len {
                 let token = block_start + token_in_block;
                 let k_base = (token * geometry.h_k + key_head) * d;
@@ -273,76 +357,91 @@ pub(crate) fn cpu_blockwise_final_state(
                     k[token_in_block * d + axis] = bf16_to_f32(prepared.k[k_base + axis]);
                     v[token_in_block * d + axis] = bf16_to_f32(prepared.v[v_base + axis]);
                 }
-                cumulative_gamma +=
-                    (prepared.alpha[token * geometry.h_v + value_head] + 1.0e-10).ln();
-                gamma[token_in_block] = cumulative_gamma;
+                cumulative_gamma_log2 +=
+                    (prepared.alpha[token * geometry.h_v + value_head] + 1.0e-10).log2();
+                gamma_log2[token_in_block] = cumulative_gamma_log2;
                 beta[token_in_block] = prepared.beta[token * geometry.h_v + value_head];
             }
+            for token_in_block in block_len..BLOCK_SIZE {
+                gamma_log2[token_in_block] = cumulative_gamma_log2;
+            }
 
-            // IKK is unit lower triangular.  Build its strict lower part in
-            // FP32, matching beta's row-wise scale in the frozen reference.
-            let mut ikk = vec![0.0_f32; block_len * block_len];
+            // KK is accumulated in FP32, scaled row-wise, and stored as FP16.
+            // CollectiveInverse ignores the stored diagonal and supplies the
+            // unit diagonal itself.
+            let mut strict_lower_f16 = vec![0.0_f32; BLOCK_SIZE * BLOCK_SIZE];
             for row in 0..block_len {
-                ikk[row * block_len + row] = 1.0;
                 for col in 0..row {
                     let mut kk = 0.0_f32;
                     for axis in 0..d {
                         kk += k[row * d + axis] * k[col * d + axis];
                     }
-                    ikk[row * block_len + col] = beta[row] * (gamma[row] - gamma[col]).exp() * kk;
+                    strict_lower_f16[row * BLOCK_SIZE + col] =
+                        round_to_f16(beta[row] * (gamma_log2[row] - gamma_log2[col]).exp2() * kk);
                 }
             }
 
-            // Solve IKK * T = diag(beta), then apply the reference's BF16 T
-            // storage boundary before any u/w matrix products.
-            let mut t = vec![0.0_f32; block_len * block_len];
+            // The inverse is reloaded from FP16, scaled column-wise by beta,
+            // then written to the BF16 operand consumed by NewV HMMA.
+            let inverse = flashinfer_unit_lower_inverse(&strict_lower_f16, BLOCK_SIZE);
+            let mut t = vec![0.0_f32; BLOCK_SIZE * BLOCK_SIZE];
             for row in 0..block_len {
                 for col in 0..=row {
-                    let mut value = if row == col { beta[row] } else { 0.0 };
-                    for inner in col..row {
-                        value -= ikk[row * block_len + inner] * t[inner * block_len + col];
-                    }
-                    t[row * block_len + col] = value;
-                }
-            }
-            for value in &mut t {
-                *value = bf16_to_f32(f32_to_bf16(*value));
-            }
-
-            let mut u = vec![0.0_f32; block_len * d];
-            let mut w = vec![0.0_f32; block_len * d];
-            for row in 0..block_len {
-                for col in 0..=row {
-                    let coefficient = t[row * block_len + col];
-                    let weighted_coefficient = coefficient * gamma[col].exp();
-                    for axis in 0..d {
-                        u[row * d + axis] += coefficient * v[col * d + axis];
-                        w[row * d + axis] += weighted_coefficient * k[col * d + axis];
-                    }
+                    t[row * BLOCK_SIZE + col] =
+                        round_to_bf16(inverse[row * BLOCK_SIZE + col] * beta[col]);
                 }
             }
 
-            let mut new_v = u;
+            // The SM120 kernel converts the FP32 running state to BF16 before
+            // SK, rounds scaled SK to BF16, and stores V-SK as BF16 before the
+            // NewV×T HMMA.
+            let state_operand: Vec<f32> = state[state_base..state_base + d * d]
+                .iter()
+                .copied()
+                .map(round_to_bf16)
+                .collect();
+            let mut residual = vec![0.0_f32; BLOCK_SIZE * d];
             for token_in_block in 0..block_len {
+                let gamma = gamma_log2[token_in_block].exp2();
                 for value_axis in 0..d {
                     let mut memory = 0.0_f32;
                     for key_axis in 0..d {
-                        memory += w[token_in_block * d + key_axis]
-                            * state[state_base + key_axis * d + value_axis];
+                        memory += state_operand[key_axis * d + value_axis]
+                            * k[token_in_block * d + key_axis];
                     }
-                    new_v[token_in_block * d + value_axis] -= memory;
+                    residual[token_in_block * d + value_axis] = round_to_bf16(
+                        v[token_in_block * d + value_axis] - round_to_bf16(gamma * memory),
+                    );
                 }
             }
 
-            let block_gamma = gamma[block_len - 1];
-            let block_decay = block_gamma.exp();
+            let mut new_v = vec![0.0_f32; BLOCK_SIZE * d];
+            for row in 0..block_len {
+                for value_axis in 0..d {
+                    let mut value = 0.0_f32;
+                    for col in 0..=row {
+                        value += t[row * BLOCK_SIZE + col] * residual[col * d + value_axis];
+                    }
+                    new_v[row * d + value_axis] = value;
+                }
+            }
+
+            let block_gamma_log2 = gamma_log2[block_len - 1];
+            let block_decay = block_gamma_log2.exp2();
+            let mut decayed_new_v = vec![0.0_f32; block_len * d];
+            for token_in_block in 0..block_len {
+                let decay = (block_gamma_log2 - gamma_log2[token_in_block]).exp2();
+                for value_axis in 0..d {
+                    decayed_new_v[token_in_block * d + value_axis] =
+                        round_to_bf16(decay * new_v[token_in_block * d + value_axis]);
+                }
+            }
             for key_axis in 0..d {
                 for value_axis in 0..d {
                     let mut increment = 0.0_f32;
                     for token_in_block in 0..block_len {
-                        increment += (block_gamma - gamma[token_in_block]).exp()
-                            * k[token_in_block * d + key_axis]
-                            * new_v[token_in_block * d + value_axis];
+                        increment += k[token_in_block * d + key_axis]
+                            * decayed_new_v[token_in_block * d + value_axis];
                     }
                     let index = state_base + key_axis * d + value_axis;
                     state[index] = block_decay * state[index] + increment;
@@ -558,5 +657,31 @@ mod tests {
         let stepwise = cpu_stepwise(geometry, &prepared, &initial).unwrap();
         let blockwise = cpu_blockwise_final_state(geometry, &prepared, &initial).unwrap();
         assert_eq!(blockwise, stepwise.final_state);
+    }
+
+    #[test]
+    fn cpu_blockwise_preserves_flashinfer_bf16_state_operand_boundary() {
+        let geometry = Geometry {
+            h_q: 1,
+            h_k: 1,
+            h_v: 1,
+            d: 2,
+            tokens: 1,
+        };
+        let prepared = Prepared {
+            q: vec![0; 2],
+            k: vec![f32_to_bf16(1.0), f32_to_bf16(0.0)],
+            v: vec![0; 2],
+            alpha: vec![1.0],
+            beta: vec![1.0],
+        };
+        let initial = vec![1.001, 0.333, 0.0, 0.0];
+        let stepwise = cpu_stepwise(geometry, &prepared, &initial).unwrap();
+        let blockwise = cpu_blockwise_final_state(geometry, &prepared, &initial).unwrap();
+
+        assert_eq!(stepwise.final_state[0], 0.0);
+        assert_eq!(stepwise.final_state[1], 0.0);
+        assert_eq!(blockwise[0], initial[0] - round_to_bf16(initial[0]));
+        assert_eq!(blockwise[1], initial[1] - round_to_bf16(initial[1]));
     }
 }

@@ -2015,11 +2015,12 @@ mod tests {
             )?;
 
             // FlashInfer's SM120 recurrence is algebraically equivalent to
-            // the token-wise CPU oracle, but its 64-token path stores the
-            // triangular T intermediate as BF16.  If the future Hv48
+            // the token-wise CPU oracle, but its 64-token path has additional
+            // FP16/BF16 boundaries around the triangular inverse, state/SK,
+            // residual, T, and decayed NewV operands.  If the future Hv48
             // specialization crosses the fixed state tolerance against the
             // semantic stepwise oracle, require it to pass the separately
-            // frozen blockwise CPU mirror with the exact same tolerance.
+            // frozen kernel-dataflow mirror with the exact same tolerance.
             // Stepwise statistics remain visible and no tolerance changes.
             let mut blockwise_handoff_state = None;
             let (cpu_flashinfer_state_gate_label, cpu_flashinfer_state_gate_stats) =
