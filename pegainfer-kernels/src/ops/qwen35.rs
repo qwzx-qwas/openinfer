@@ -22,7 +22,7 @@ use crate::ffi;
 use crate::tensor::DeviceContext;
 use crate::tensor::HiddenStates;
 
-pub const QWEN35_GDN_ABI_VERSION: u32 = 1;
+pub const QWEN35_GDN_ABI_VERSION: u32 = 2;
 const BF16_DTYPE: u32 = 1;
 const F32_DTYPE: u32 = 2;
 const HKV_V_CONTIGUOUS_LAYOUT: u32 = 1;
@@ -92,6 +92,32 @@ fn linked_artifact_support(sm: i32, geometry: Qwen35GdnGeometry) -> Result<Qwen3
     }
 }
 
+fn checked_cu_seqlens(sequence_lengths: &[usize]) -> Result<Vec<i64>> {
+    ensure!(
+        !sequence_lengths.is_empty(),
+        "Qwen3.5 GDN batch requires at least one sequence"
+    );
+    let mut total = 0usize;
+    ensure!(
+        sequence_lengths.len() <= (i32::MAX as usize / Qwen35GdnGeometry::PRODUCTION.h_v),
+        "Qwen3.5 GDN sequence count exceeds grid extent"
+    );
+    let mut offsets = Vec::with_capacity(sequence_lengths.len() + 1);
+    offsets.push(0_i64);
+    for (index, &tokens) in sequence_lengths.iter().enumerate() {
+        ensure!(tokens > 0, "Qwen3.5 GDN sequence {index} has T=0");
+        total = total
+            .checked_add(tokens)
+            .context("Qwen3.5 GDN total token extent overflow")?;
+        ensure!(
+            total <= i32::MAX as usize,
+            "Qwen3.5 GDN total token extent exceeds i32"
+        );
+        offsets.push(total as i64);
+    }
+    Ok(offsets)
+}
+
 #[derive(Debug)]
 pub struct Qwen35GdnAot {
     handle: NonNull<c_void>,
@@ -105,6 +131,7 @@ pub struct Qwen35GdnWorkspace {
     workspace: CudaSlice<u8>,
     cu_seqlens: CudaSlice<i64>,
     tokens: usize,
+    num_seqs: usize,
 }
 
 // The handle is bound to one CUDA device and all launches are issued by the
@@ -186,20 +213,30 @@ impl Qwen35GdnAot {
         ctx: &DeviceContext,
         tokens: usize,
     ) -> Result<Qwen35GdnWorkspace> {
-        ensure!(tokens > 0, "Qwen3.5 GDN workspace requires T>=1");
+        self.allocate_batch_workspace(ctx, &[tokens])
+    }
+
+    pub fn allocate_batch_workspace(
+        &self,
+        ctx: &DeviceContext,
+        sequence_lengths: &[usize],
+    ) -> Result<Qwen35GdnWorkspace> {
+        let cu_seqlens = checked_cu_seqlens(sequence_lengths)?;
+        let tokens = usize::try_from(*cu_seqlens.last().expect("non-empty cu_seqlens"))
+            .context("Qwen3.5 GDN total token extent exceeds usize")?;
         let workspace = ctx
             .stream
             .alloc_zeros(self.workspace_bytes)
             .map_err(|error| anyhow::anyhow!("allocate Qwen3.5 GDN workspace: {error}"))?;
-        let end = i64::try_from(tokens).context("Qwen3.5 GDN T exceeds i64")?;
         let cu_seqlens = ctx
             .stream
-            .clone_htod(&[0_i64, end])
+            .clone_htod(&cu_seqlens)
             .map_err(|error| anyhow::anyhow!("upload Qwen3.5 GDN sequence metadata: {error}"))?;
         Ok(Qwen35GdnWorkspace {
             workspace,
             cu_seqlens,
             tokens,
+            num_seqs: sequence_lengths.len(),
         })
     }
 
@@ -221,6 +258,7 @@ impl Qwen35GdnAot {
             state.len() == state_elements,
             "Qwen3.5 GDN state length mismatch"
         );
+        let state_len = state.len();
         let (state_ptr, _state) = state.device_ptr_mut(&ctx.stream);
         self.launch_with_state_pointers(
             ctx,
@@ -231,6 +269,46 @@ impl Qwen35GdnAot {
             beta,
             state_ptr,
             state_ptr,
+            state_len,
+            output,
+            launch_workspace,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_batch_in_place(
+        &self,
+        ctx: &DeviceContext,
+        q: &HiddenStates,
+        k: &HiddenStates,
+        v: &HiddenStates,
+        alpha: &CudaSlice<f32>,
+        beta: &CudaSlice<f32>,
+        state: &mut CudaSlice<f32>,
+        output: &mut HiddenStates,
+        launch_workspace: &mut Qwen35GdnWorkspace,
+    ) -> Result<()> {
+        let expected = launch_workspace.num_seqs
+            * self.geometry.h_v
+            * self.geometry.head_dim
+            * self.geometry.head_dim;
+        ensure!(
+            launch_workspace.num_seqs > 0 && state.len() == expected,
+            "Qwen3.5 GDN batched state length mismatch: got {}, expected {expected}",
+            state.len()
+        );
+        let state_len = state.len();
+        let (state_ptr, _state) = state.device_ptr_mut(&ctx.stream);
+        self.launch_with_state_pointers(
+            ctx,
+            q,
+            k,
+            v,
+            alpha,
+            beta,
+            state_ptr,
+            state_ptr,
+            state_len,
             output,
             launch_workspace,
         )
@@ -256,6 +334,7 @@ impl Qwen35GdnAot {
             initial_state.len() == state_elements && state.len() == state_elements,
             "Qwen3.5 GDN separate-state length mismatch"
         );
+        let state_len = state.len();
         let (initial_state_ptr, _initial_state) = initial_state.device_ptr(&ctx.stream);
         let (state_ptr, _state) = state.device_ptr_mut(&ctx.stream);
         self.launch_with_state_pointers(
@@ -267,6 +346,7 @@ impl Qwen35GdnAot {
             beta,
             state_ptr,
             initial_state_ptr,
+            state_len,
             output,
             launch_workspace,
         )
@@ -283,6 +363,7 @@ impl Qwen35GdnAot {
         beta: &CudaSlice<f32>,
         state_ptr: u64,
         initial_state_ptr: u64,
+        state_elements: usize,
         output: &mut HiddenStates,
         launch_workspace: &mut Qwen35GdnWorkspace,
     ) -> Result<()> {
@@ -307,7 +388,8 @@ impl Qwen35GdnAot {
             alpha.len() == t * g.h_v
                 && beta.len() == t * g.h_v
                 && launch_workspace.workspace.len() >= self.workspace_bytes
-                && launch_workspace.cu_seqlens.len() == 2
+                && launch_workspace.num_seqs > 0
+                && launch_workspace.cu_seqlens.len() == launch_workspace.num_seqs + 1
                 && launch_workspace.tokens == t,
             "Qwen3.5 GDN buffer contract mismatch"
         );
@@ -332,11 +414,20 @@ impl Qwen35GdnAot {
             beta: beta_ptr,
             state: state_ptr,
             initial_state: initial_state_ptr,
+            state_bytes: (state_elements * size_of::<f32>()) as u64,
             workspace: workspace_ptr,
             workspace_bytes,
             cu_seqlens: cu_ptr,
-            cu_seqlens_len: 2,
+            cu_seqlens_len: launch_workspace
+                .cu_seqlens
+                .len()
+                .try_into()
+                .context("Qwen3.5 GDN cu_seqlens length exceeds u32")?,
             tokens: t.try_into().context("Qwen3.5 GDN T exceeds u32")?,
+            num_seqs: launch_workspace
+                .num_seqs
+                .try_into()
+                .context("Qwen3.5 GDN sequence count exceeds u32")?,
             h_q: g.h_q as u32,
             h_k: g.h_k as u32,
             h_v: g.h_v as u32,
@@ -370,7 +461,7 @@ mod tests {
     fn stable_c_struct_layout_is_frozen() {
         assert_eq!(size_of::<ffi::FlashInferGdnSpec>(), 40);
         assert_eq!(align_of::<ffi::FlashInferGdnSpec>(), 4);
-        assert_eq!(size_of::<ffi::FlashInferGdnPrefillArgs>(), 128);
+        assert_eq!(size_of::<ffi::FlashInferGdnPrefillArgs>(), 144);
         assert_eq!(align_of::<ffi::FlashInferGdnPrefillArgs>(), 8);
     }
 
@@ -392,6 +483,16 @@ mod tests {
             qwen35_gdn_capability(120, Qwen35GdnGeometry::PRODUCTION),
             Qwen35GdnSupport::Supported
         );
+    }
+
+    #[test]
+    fn ragged_cu_seqlens_are_monotonic_and_exact() {
+        assert_eq!(
+            checked_cu_seqlens(&[1, 2, 63, 65]).unwrap(),
+            [0, 1, 3, 66, 131]
+        );
+        assert!(checked_cu_seqlens(&[]).is_err());
+        assert!(checked_cu_seqlens(&[1, 0, 2]).is_err());
     }
 
     #[test]
@@ -504,6 +605,138 @@ mod tests {
         ensure!(
             launches - launches_before == 14,
             "stable C ABI launch counter expected fourteen alias/separate launches, observed {}",
+            launches - launches_before
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires an SM120 GPU and a build-linked validated FlashInfer GDN AOT bundle"]
+    fn sm120_ragged_batch_matches_serial_launches() -> Result<()> {
+        let ctx = DeviceContext::new()?;
+        let geometry = Qwen35GdnGeometry::PRODUCTION;
+        let backend = Qwen35GdnAot::load_for_production(&ctx, geometry)?
+            .context("validated FlashInfer GDN AOT bundle is not available on SM120")?;
+        let launches_before = backend.successful_launch_counter().load(Ordering::Relaxed);
+        let q_dim = geometry.h_q * geometry.head_dim;
+        let k_dim = geometry.h_k * geometry.head_dim;
+        let v_dim = geometry.h_v * geometry.head_dim;
+        let state_elements = geometry.h_v * geometry.head_dim * geometry.head_dim;
+        let values = |elements: usize, modulus: usize, scale: f32| {
+            (0..elements)
+                .map(|index| {
+                    let signed = (index % modulus) as i32 - (modulus / 2) as i32;
+                    bf16::from_f32(signed as f32 * scale)
+                })
+                .collect::<Vec<_>>()
+        };
+
+        for lengths in [
+            vec![1_usize, 65],
+            vec![2, 63, 64, 127],
+            vec![1, 2, 63, 64, 65, 127, 128, 2048],
+        ] {
+            let total_tokens = lengths.iter().sum::<usize>();
+            let q_host = values(total_tokens * q_dim, 127, 1.0 / 1024.0);
+            let k_host = values(total_tokens * k_dim, 113, 1.0 / 1024.0);
+            let v_host = values(total_tokens * v_dim, 97, 1.0 / 128.0);
+            let alpha_host = vec![0.9921875_f32; total_tokens * geometry.h_v];
+            let beta_host = vec![0.5_f32; total_tokens * geometry.h_v];
+            let initial_host = (0..lengths.len() * state_elements)
+                .map(|index| ((index % 257) as f32 - 128.0) * 1.0e-4)
+                .collect::<Vec<_>>();
+
+            let q = HiddenStates::from_host(&ctx, &q_host, q_dim, total_tokens)?;
+            let k = HiddenStates::from_host(&ctx, &k_host, k_dim, total_tokens)?;
+            let v = HiddenStates::from_host(&ctx, &v_host, v_dim, total_tokens)?;
+            let alpha = ctx.stream.clone_htod(&alpha_host)?;
+            let beta = ctx.stream.clone_htod(&beta_host)?;
+            let mut batch_state = ctx.stream.clone_htod(&initial_host)?;
+            let mut batch_output = HiddenStates::zeros(&ctx, v_dim, total_tokens)?;
+            let mut batch_workspace = backend.allocate_batch_workspace(&ctx, &lengths)?;
+            backend.launch_batch_in_place(
+                &ctx,
+                &q,
+                &k,
+                &v,
+                &alpha,
+                &beta,
+                &mut batch_state,
+                &mut batch_output,
+                &mut batch_workspace,
+            )?;
+
+            let mut serial_outputs = Vec::with_capacity(total_tokens * v_dim);
+            let mut serial_states = Vec::with_capacity(lengths.len() * state_elements);
+            let mut token_offset = 0usize;
+            for (sequence_idx, &tokens) in lengths.iter().enumerate() {
+                let q_begin = token_offset * q_dim;
+                let k_begin = token_offset * k_dim;
+                let v_begin = token_offset * v_dim;
+                let gate_begin = token_offset * geometry.h_v;
+                let state_begin = sequence_idx * state_elements;
+                let sequence_q = HiddenStates::from_host(
+                    &ctx,
+                    &q_host[q_begin..q_begin + tokens * q_dim],
+                    q_dim,
+                    tokens,
+                )?;
+                let sequence_k = HiddenStates::from_host(
+                    &ctx,
+                    &k_host[k_begin..k_begin + tokens * k_dim],
+                    k_dim,
+                    tokens,
+                )?;
+                let sequence_v = HiddenStates::from_host(
+                    &ctx,
+                    &v_host[v_begin..v_begin + tokens * v_dim],
+                    v_dim,
+                    tokens,
+                )?;
+                let sequence_alpha = ctx
+                    .stream
+                    .clone_htod(&alpha_host[gate_begin..gate_begin + tokens * geometry.h_v])?;
+                let sequence_beta = ctx
+                    .stream
+                    .clone_htod(&beta_host[gate_begin..gate_begin + tokens * geometry.h_v])?;
+                let mut sequence_state = ctx
+                    .stream
+                    .clone_htod(&initial_host[state_begin..state_begin + state_elements])?;
+                let mut sequence_output = HiddenStates::zeros(&ctx, v_dim, tokens)?;
+                let mut sequence_workspace = backend.allocate_workspace(&ctx, tokens)?;
+                backend.launch_in_place(
+                    &ctx,
+                    &sequence_q,
+                    &sequence_k,
+                    &sequence_v,
+                    &sequence_alpha,
+                    &sequence_beta,
+                    &mut sequence_state,
+                    &mut sequence_output,
+                    &mut sequence_workspace,
+                )?;
+                serial_outputs.extend(sequence_output.to_host(&ctx)?);
+                serial_states.extend(ctx.stream.clone_dtoh(&sequence_state)?);
+                token_offset += tokens;
+            }
+
+            let batch_outputs = batch_output.to_host(&ctx)?;
+            let batch_states = ctx.stream.clone_dtoh(&batch_state)?;
+            ctx.sync()?;
+            ensure!(
+                batch_outputs == serial_outputs,
+                "ragged batch output differs from serial launches for lengths {lengths:?}"
+            );
+            ensure!(
+                batch_states == serial_states,
+                "ragged batch state differs from serial launches for lengths {lengths:?}"
+            );
+        }
+
+        let launches = backend.successful_launch_counter().load(Ordering::Relaxed);
+        ensure!(
+            launches - launches_before == 17,
+            "ragged batch test expected seventeen launches, observed {}",
             launches - launches_before
         );
         Ok(())

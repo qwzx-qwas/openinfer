@@ -1,6 +1,7 @@
 #include "flashinfer_gdn_aot.h"
 
 #include <cuda_runtime.h>
+#include <limits.h>
 #include <stdlib.h>
 
 #include "flashinfer_gdn_build_config.h"
@@ -133,7 +134,10 @@ int32_t pegainfer_qwen35_gdn_launch(void *handle,
     if (handle == NULL || args == NULL ||
         args->struct_size != sizeof(*args) || args->tokens == 0 ||
         args->h_q != 16 || args->h_k != 16 || args->h_v != 32 ||
-        args->head_dim != 128 || args->cu_seqlens_len != 2 ||
+        args->head_dim != 128 || args->num_seqs == 0 ||
+        args->num_seqs > (uint32_t)(INT32_MAX / 32) ||
+        args->tokens > (uint32_t)INT32_MAX ||
+        args->cu_seqlens_len != args->num_seqs + 1 ||
         args->q == NULL || args->k == NULL || args->v == NULL ||
         args->output == NULL || args->alpha == NULL || args->beta == NULL ||
         args->state == NULL || args->initial_state == NULL ||
@@ -143,6 +147,10 @@ int32_t pegainfer_qwen35_gdn_launch(void *handle,
     }
     if (args->abi_version != PEGAINFER_QWEN35_GDN_ABI_VERSION)
         return PEGAINFER_QWEN35_GDN_ABI_MISMATCH;
+    const size_t expected_state_bytes =
+        (size_t)args->num_seqs * 32u * 128u * 128u * sizeof(float);
+    if (args->state_bytes != expected_state_bytes)
+        return PEGAINFER_QWEN35_GDN_INVALID_ARGUMENT;
     gdn_handle_t *owner = (gdn_handle_t *)handle;
     cudaError_t cuda_rc = cudaSetDevice(owner->device);
     if (cuda_rc != cudaSuccess) return status_from_cuda(cuda_rc);
@@ -157,7 +165,8 @@ int32_t pegainfer_qwen35_gdn_launch(void *handle,
     int32_t tokens = (int32_t)args->tokens;
     int32_t gates = tokens * 32;
     int32_t workspace_bytes = (int32_t)args->workspace_bytes;
-    int32_t cu_count = 2;
+    int32_t num_seqs = (int32_t)args->num_seqs;
+    int32_t cu_count = (int32_t)args->cu_seqlens_len;
     pegainfer_qwen35_gdn_qwen35_4b_candidate_Tensor_g_q_t q = {
         (void *)args->q, {tokens}};
     pegainfer_qwen35_gdn_qwen35_4b_candidate_Tensor_g_k_t k = {
@@ -181,7 +190,8 @@ int32_t pegainfer_qwen35_gdn_launch(void *handle,
     int32_t rc = cute_dsl_pegainfer_qwen35_gdn_qwen35_4b_candidate_wrapper(
         &owner->module, &q, &k, &v, &output, &alpha, &beta, &state,
         &initial, &workspace, &cu_seqlens, 0.08838834764831845f,
-        16, 16, 32, 32, 1, 1, 0, 32, (cudaStream_t)args->stream);
+        16, 16, 32, 32, num_seqs, 1, 0, num_seqs * 32,
+        (cudaStream_t)args->stream);
     return rc == 0 ? PEGAINFER_QWEN35_GDN_OK
                    : PEGAINFER_QWEN35_GDN_CUDA_ERROR;
 #else

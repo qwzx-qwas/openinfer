@@ -7,7 +7,7 @@
 extern "C" {
 #endif
 
-#define PEGAINFER_QWEN35_GDN_ABI_VERSION 1u
+#define PEGAINFER_QWEN35_GDN_ABI_VERSION 2u
 
 typedef enum {
     PEGAINFER_QWEN35_GDN_OK = 0,
@@ -41,11 +41,13 @@ typedef struct {
     const void *beta;
     void *state;
     const void *initial_state;
+    size_t state_bytes;
     void *workspace;
     size_t workspace_bytes;
     const int64_t *cu_seqlens;
     uint32_t cu_seqlens_len;
     uint32_t tokens;
+    uint32_t num_seqs;
     uint32_t h_q;
     uint32_t h_k;
     uint32_t h_v;

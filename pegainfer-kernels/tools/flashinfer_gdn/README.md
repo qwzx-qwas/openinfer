@@ -12,6 +12,11 @@ diagnostic variant. Only SM120 + Hq/Hk/Hv/D=`16/16/32/128`, BF16 inputs, FP32
 HKV state, single GPU is eligible for production selection. Other capabilities
 retain the Triton path; a selected but invalid bundle fails at build time.
 
+The kernels-owned stable wrapper uses ABI version 2. Ragged execution supplies
+`num_seqs` and int64 `cu_seqlens`; the Rust boundary validates non-empty,
+monotonic sequence extents and exact state bytes before the C wrapper derives
+the CuTe grid. B=1 remains the single-sequence specialization of this contract.
+
 The canonical generator CLI is:
 
 ```bash

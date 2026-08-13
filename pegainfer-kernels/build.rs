@@ -41,7 +41,7 @@ struct FlashInferIncludes {
     cccl: Vec<PathBuf>,
 }
 
-const QWEN35_GDN_AOT_ABI_VERSION: u64 = 1;
+const QWEN35_GDN_AOT_ABI_VERSION: u64 = 2;
 const QWEN35_GDN_AOT_ENV: &str = "PEGAINFER_QWEN35_GDN_AOT_BUNDLE";
 
 fn sha256_file(path: &Path) -> String {
@@ -116,6 +116,10 @@ fn build_qwen35_flashinfer_gdn_aot(
         assert_eq!(
             json_u64(&manifest, &["abi", "version"]),
             QWEN35_GDN_AOT_ABI_VERSION
+        );
+        assert_eq!(
+            json_str(&manifest, &["abi", "batching"]),
+            "ragged_cu_seqlens"
         );
         assert_eq!(json_u64(&manifest, &["geometry", "h_q"]), 16);
         assert_eq!(json_u64(&manifest, &["geometry", "h_k"]), 16);

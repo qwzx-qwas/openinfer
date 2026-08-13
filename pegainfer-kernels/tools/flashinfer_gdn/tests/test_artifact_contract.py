@@ -82,6 +82,8 @@ class ArtifactContractTests(unittest.TestCase):
             self.assertEqual({m["geometry"]["h_v"] for m in manifests}, {32, 48})
             self.assertTrue(all(m["tokens"] == {"extent": "dynamic", "minimum": 1, "divisibility": 1} for m in manifests))
             self.assertTrue(all(m["abi"]["geometry_binding"] == "stable_project_c_wrapper" for m in manifests))
+            self.assertTrue(all(m["abi"]["version"] == 2 for m in manifests))
+            self.assertTrue(all(m["abi"]["batching"] == "ragged_cu_seqlens" for m in manifests))
             self.assertTrue(all(m["distribution"]["cute_runtime_linkage"] == "static" for m in manifests))
             self.assertTrue(all(not m["distribution"]["cuda_driver_jit_required"] for m in manifests))
 

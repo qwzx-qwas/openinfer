@@ -365,9 +365,10 @@ def build_manifest(
         "dtypes": spec["dtypes"],
         "tokens": spec["tokens"],
         "abi": {
-            "version": 1,
+            "version": 2,
             "function_prefix": compile_metadata["aot"]["function_prefix"],
             "geometry_binding": "stable_project_c_wrapper",
+            "batching": "ragged_cu_seqlens",
             "q_view": {"shape": ["T", 128, spec["geometry"]["h_q"]], "stride": [spec["geometry"]["h_q"] * 128, 1, 128]},
             "k_view": {"shape": [128, "T", spec["geometry"]["h_k"]], "stride": [1, spec["geometry"]["h_k"] * 128, 128]},
             "v_view": {"shape": [128, "T", spec["geometry"]["h_v"]], "stride": [1, spec["geometry"]["h_v"] * 128, 128]},
@@ -554,13 +555,14 @@ def validate_manifest(
     abi = manifest.get("abi")
     if not isinstance(abi, dict):
         raise ContractError("ABI metadata is missing")
-    _require_equal(abi.get("version"), 1, "stable C ABI version")
+    _require_equal(abi.get("version"), 2, "stable C ABI version")
     _require_equal(abi.get("function_prefix"), f"pegainfer_qwen35_gdn_{variant}", "AOT function prefix")
     _require_equal(
         abi.get("geometry_binding"),
         "stable_project_c_wrapper",
         "geometry binding",
     )
+    _require_equal(abi.get("batching"), "ragged_cu_seqlens", "batching contract")
     _require_equal(
         abi.get("state_layout"),
         "openinfer_hkv_v_contiguous",
