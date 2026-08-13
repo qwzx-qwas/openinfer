@@ -1,3 +1,4 @@
+use anyhow::Context;
 use anyhow::Result;
 use cudarc::driver::CudaSlice;
 use cudarc::driver::DevicePtr;
@@ -24,7 +25,7 @@ use pegainfer_core::kv_pool::KvState;
 use pegainfer_core::tensor::DeviceVec;
 use pegainfer_core::tensor::HiddenStates;
 
-use super::flashinfer_gdn::FlashInferGdnChunkResources;
+use super::flashinfer_gdn::FlashInferGdnBatchResources;
 use super::flashinfer_gdn::GdnPrefillBackend;
 pub use super::flashinfer_gdn::GdnPrefillRuntimeEvidence;
 pub use super::flashinfer_gdn::GdnPrefillRuntimeEvidenceHandle;
@@ -41,7 +42,7 @@ use crate::ops::PrefillPagedPlan;
 
 enum GdnPrefillChunkScratch {
     Triton(Box<GdrChunkwiseScratch35>),
-    FlashInfer(Box<FlashInferGdnChunkResources>),
+    FlashInfer(Box<FlashInferGdnBatchResources>),
 }
 
 fn checked_prefill_end_pos(
@@ -110,6 +111,154 @@ impl Qwen35Model {
 
         // Last-token logic runs once, on the final chunk's output.
         ops::extract_vec(&self.ctx, &hidden_batch, hidden_batch.seq_len - 1)
+    }
+
+    /// Layer-major multi-sequence prefill for the production FlashInfer GDN
+    /// specialization. Request-owned KV, convolution, and recurrent states stay
+    /// independent; only the execution buffers are flattened for this call.
+    pub(super) fn prefill_batch_last_hidden_flashinfer(
+        &self,
+        token_ids: &[&[u32]],
+        kv_states: &mut [KvState],
+        recurrent_states: &mut [&mut RecurrentState],
+    ) -> Result<Vec<DeviceVec>> {
+        let num_seqs = token_ids.len();
+        anyhow::ensure!(num_seqs > 1, "batched FlashInfer prefill requires B>1");
+        anyhow::ensure!(
+            kv_states.len() == num_seqs && recurrent_states.len() == num_seqs,
+            "batched FlashInfer prefill state count mismatch"
+        );
+        let sequence_lengths = token_ids
+            .iter()
+            .map(|tokens| tokens.len())
+            .collect::<Vec<_>>();
+        let total_tokens = sequence_lengths.iter().try_fold(0usize, |total, &tokens| {
+            anyhow::ensure!(
+                tokens > 0,
+                "batched FlashInfer prefill contains an empty sequence"
+            );
+            total
+                .checked_add(tokens)
+                .context("batched FlashInfer prefill token extent overflow")
+        })?;
+        anyhow::ensure!(
+            total_tokens <= PREFILL_CHUNK_LEN,
+            "batched FlashInfer prefill has {total_tokens} tokens, capacity is {PREFILL_CHUNK_LEN}"
+        );
+
+        let mut offsets = Vec::with_capacity(num_seqs + 1);
+        offsets.push(0usize);
+        for &tokens in &sequence_lengths {
+            offsets.push(offsets.last().copied().expect("offset zero") + tokens);
+        }
+        let flat_token_ids = token_ids
+            .iter()
+            .flat_map(|tokens| tokens.iter().copied())
+            .collect::<Vec<_>>();
+
+        for ((kv_state, recurrent), &tokens) in kv_states
+            .iter()
+            .zip(recurrent_states.iter())
+            .zip(sequence_lengths.iter())
+        {
+            let end_pos = checked_prefill_end_pos(
+                kv_state.seq_len(),
+                tokens,
+                self.config.max_position_embeddings,
+            )?;
+            self.ensure_rope_cache_covers(end_pos)?;
+            anyhow::ensure!(
+                recurrent.seq_len == kv_state.seq_len(),
+                "batched FlashInfer prefill KV/recurrent position mismatch"
+            );
+        }
+
+        let backend = self.flashinfer_gdn()?;
+        let mut gdn = FlashInferGdnBatchResources::new_batch(
+            &self.ctx,
+            &self.config,
+            backend,
+            &sequence_lengths,
+        )?;
+        let token_ids_gpu = self
+            .ctx
+            .stream
+            .clone_htod(&flat_token_ids)
+            .map_err(|error| anyhow::anyhow!("batched prefill token upload failed: {error}"))?;
+        let mut hidden = HiddenStates::zeros(&self.ctx, self.config.hidden_size, total_tokens)?;
+        ops::embedding_batch(&self.ctx, &self.embed_tokens, &token_ids_gpu, &mut hidden)?;
+
+        let mut plans = Vec::with_capacity(num_seqs);
+        for (kv_state, &tokens) in kv_states.iter_mut().zip(sequence_lengths.iter()) {
+            let base_pos = kv_state.seq_len();
+            let end_pos = base_pos + tokens;
+            kv_state.ensure_capacity(end_pos)?;
+            kv_state.advance(tokens);
+            plans.push(PrefillPagedPlan::new(
+                &self.ctx,
+                &kv_state.desc(),
+                base_pos,
+                tokens,
+                self.config.local_num_attention_heads(self.tensor_parallel),
+                self.config.local_num_key_value_heads(self.tensor_parallel),
+                self.config.head_dim,
+            )?);
+        }
+
+        let c = &self.config;
+        let mut linear_idx = 0usize;
+        let mut full_idx = 0usize;
+        for layer in &self.layers {
+            let mut normed =
+                self.batched_rms_norm_offset(&hidden, &layer.input_layernorm, c.rms_norm_eps)?;
+            let attn_results = match &layer.attn {
+                LayerKind::LinearAttention(attn) => self
+                    .prefill_linear_attention_batch_flashinfer(
+                        attn,
+                        &normed,
+                        linear_idx,
+                        recurrent_states,
+                        &offsets,
+                        &mut gdn,
+                    )?,
+                LayerKind::FullAttention(attn) => self.prefill_full_attention_batch_sequences(
+                    attn, &normed, full_idx, kv_states, &plans, &offsets,
+                )?,
+            };
+            match &layer.attn {
+                LayerKind::LinearAttention(_) => linear_idx += 1,
+                LayerKind::FullAttention(_) => full_idx += 1,
+            }
+
+            let hidden_plus_attn = ops::add_batch(&self.ctx, &hidden, &attn_results)?;
+            normed = self.batched_rms_norm_offset(
+                &hidden_plus_attn,
+                &layer.post_attention_layernorm,
+                c.rms_norm_eps,
+            )?;
+            let gate_up = ops::gemm(&self.ctx, &layer.mlp.gate_up_proj, &normed)?;
+            let mut activated = HiddenStates::zeros(
+                &self.ctx,
+                c.local_intermediate_size(self.tensor_parallel),
+                total_tokens,
+            )?;
+            ops::silu_mul_fused_batch_into(&self.ctx, &gate_up, &mut activated)?;
+            let mut mlp = ops::gemm(&self.ctx, &layer.mlp.down_proj, &activated)?;
+            self.all_reduce_hidden(&mut mlp)?;
+            hidden = ops::add_batch(&self.ctx, &hidden_plus_attn, &mlp)?;
+        }
+        gdn.ensure_prepare_inputs_finite(&self.ctx)?;
+
+        let mut last_hiddens = Vec::with_capacity(num_seqs);
+        for (index, recurrent) in recurrent_states.iter_mut().enumerate() {
+            recurrent.seq_len += sequence_lengths[index];
+            last_hiddens.push(ops::extract_vec(
+                &self.ctx,
+                &hidden,
+                offsets[index + 1] - 1,
+            )?);
+        }
+        Ok(last_hiddens)
     }
 
     pub(super) fn batch_last_hidden_logits(
@@ -199,7 +348,7 @@ impl Qwen35Model {
             )),
             GdnPrefillBackend::FlashInfer => {
                 let backend = self.flashinfer_gdn()?;
-                GdnPrefillChunkScratch::FlashInfer(Box::new(FlashInferGdnChunkResources::new(
+                GdnPrefillChunkScratch::FlashInfer(Box::new(FlashInferGdnBatchResources::new(
                     &self.ctx,
                     &self.config,
                     backend,
@@ -473,6 +622,164 @@ impl Qwen35Model {
         let mut projected = ops::gemm(&self.ctx, &attn.o_proj, &attn_out_batch)?;
         self.all_reduce_hidden(&mut projected)?;
         Ok(projected)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prefill_full_attention_batch_sequences(
+        &self,
+        attn: &FullAttentionLayer,
+        normed: &HiddenStates,
+        full_idx: usize,
+        kv_states: &[KvState],
+        plans: &[PrefillPagedPlan],
+        offsets: &[usize],
+    ) -> Result<HiddenStates> {
+        anyhow::ensure!(
+            kv_states.len() == plans.len() && offsets.len() == kv_states.len() + 1,
+            "batched full-attention metadata mismatch"
+        );
+        let mut joined = HiddenStates::zeros(&self.ctx, self.config.hidden_size, normed.seq_len)?;
+        for index in 0..kv_states.len() {
+            let start = offsets[index];
+            let tokens = offsets[index + 1] - start;
+            let mut sequence = HiddenStates::zeros(&self.ctx, normed.hidden_dim, tokens)?;
+            ops::copy_hidden_token_range_into(&self.ctx, normed, start, &mut sequence, 0, tokens)?;
+            let mut sequence_full_idx = full_idx;
+            let result = self.prefill_full_attention(
+                attn,
+                &sequence,
+                &mut sequence_full_idx,
+                &kv_states[index],
+                &plans[index],
+                self.config.local_full_attn_q_dim(self.tensor_parallel),
+                tokens,
+            )?;
+            anyhow::ensure!(
+                sequence_full_idx == full_idx + 1,
+                "batched full-attention layer index did not advance exactly once"
+            );
+            ops::copy_hidden_token_range_into(&self.ctx, &result, 0, &mut joined, start, tokens)?;
+        }
+        Ok(joined)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prefill_linear_attention_batch_flashinfer(
+        &self,
+        attn: &LinearAttentionLayer,
+        normed: &HiddenStates,
+        linear_idx: usize,
+        recurrent_states: &mut [&mut RecurrentState],
+        offsets: &[usize],
+        resources: &mut FlashInferGdnBatchResources,
+    ) -> Result<HiddenStates> {
+        let c = &self.config;
+        let total_tokens = normed.seq_len;
+        anyhow::ensure!(
+            offsets.len() == recurrent_states.len() + 1
+                && resources.num_seqs == recurrent_states.len(),
+            "batched linear-attention metadata mismatch"
+        );
+
+        let qkv = ops::gemm(&self.ctx, &attn.in_proj_qkv, normed)?;
+        let z = ops::gemm(&self.ctx, &attn.in_proj_z, normed)?;
+        let b = ops::gemm(&self.ctx, &attn.in_proj_b, normed)?;
+        let a = ops::gemm(&self.ctx, &attn.in_proj_a, normed)?;
+        let qkv_dim = c.linear_attn_qkv_dim();
+        let z_dim = c.linear_attn_z_dim();
+        let mut qkv_conv = HiddenStates::zeros(&self.ctx, qkv_dim, total_tokens)?;
+
+        for (sequence_idx, recurrent) in recurrent_states.iter_mut().enumerate() {
+            let start = offsets[sequence_idx];
+            let tokens = offsets[sequence_idx + 1] - start;
+            let mut sequence_qkv = HiddenStates::zeros(&self.ctx, qkv_dim, tokens)?;
+            let mut sequence_conv = HiddenStates::zeros(&self.ctx, qkv_dim, tokens)?;
+            ops::copy_hidden_token_range_into(
+                &self.ctx,
+                &qkv,
+                start,
+                &mut sequence_qkv,
+                0,
+                tokens,
+            )?;
+            ops::conv1d_prefill_batch_into(
+                &self.ctx,
+                &sequence_qkv,
+                &attn.conv1d_weight,
+                &mut recurrent.layers[linear_idx].conv_state,
+                &mut sequence_conv,
+                c.linear_conv_kernel_dim,
+            );
+            ops::copy_hidden_token_range_into(
+                &self.ctx,
+                &sequence_conv,
+                0,
+                &mut qkv_conv,
+                start,
+                tokens,
+            )?;
+        }
+
+        ops::gated_delta_rule_prefill_native_prepare_into(
+            &self.ctx,
+            &qkv_conv,
+            &b,
+            &a,
+            &attn.dt_bias,
+            &attn.a_log,
+            &mut resources.prepare,
+            c.linear_num_key_heads,
+            c.linear_num_key_heads,
+            c.linear_num_value_heads,
+            c.linear_key_head_dim,
+        )?;
+
+        let state_elements = resources.state_elements_per_sequence;
+        {
+            let staged_state = resources
+                .state
+                .as_mut()
+                .context("batched FlashInfer prefill has no staged state")?;
+            for (sequence_idx, recurrent) in recurrent_states.iter_mut().enumerate() {
+                let state = &recurrent.layers[linear_idx].state;
+                anyhow::ensure!(
+                    state.len() == state_elements,
+                    "request {sequence_idx} GDN state length mismatch"
+                );
+                let begin = sequence_idx * state_elements;
+                let mut destination = staged_state.slice_mut(begin..begin + state_elements);
+                self.ctx
+                    .stream
+                    .memcpy_dtod(state, &mut destination)
+                    .map_err(|error| anyhow::anyhow!("gather GDN state {sequence_idx}: {error}"))?;
+            }
+        }
+        resources.launch_staged_batch(&self.ctx, self.flashinfer_gdn()?)?;
+        let staged_state = resources
+            .state
+            .as_ref()
+            .context("batched FlashInfer prefill lost staged state")?;
+        for (sequence_idx, recurrent) in recurrent_states.iter_mut().enumerate() {
+            let begin = sequence_idx * state_elements;
+            let source = staged_state.slice(begin..begin + state_elements);
+            self.ctx
+                .stream
+                .memcpy_dtod(&source, &mut recurrent.layers[linear_idx].state)
+                .map_err(|error| anyhow::anyhow!("scatter GDN state {sequence_idx}: {error}"))?;
+        }
+
+        let mut normalized = HiddenStates::zeros(&self.ctx, z_dim, total_tokens)?;
+        ops::rms_norm_gated_batch_into(
+            &self.ctx,
+            &resources.output,
+            &attn.norm_weight,
+            &z,
+            &mut normalized,
+            c.linear_num_value_heads,
+            c.linear_value_head_dim,
+            c.rms_norm_eps,
+        );
+        ops::gemm(&self.ctx, &attn.out_proj, &normalized)
     }
 
     fn prefill_linear_attention(

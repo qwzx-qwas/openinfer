@@ -4,6 +4,7 @@ pub(crate) use pegainfer_core::ops::GEMM_LT_MAX_N;
 pub(crate) use pegainfer_core::ops::PrefillPagedPlan;
 pub(crate) use pegainfer_core::ops::add_batch;
 pub(crate) use pegainfer_core::ops::add_batch_into;
+pub(crate) use pegainfer_core::ops::copy_hidden_token_range_into;
 pub(crate) use pegainfer_core::ops::embedding_batch;
 pub(crate) use pegainfer_core::ops::extract_vec;
 pub(crate) use pegainfer_core::ops::gemm;

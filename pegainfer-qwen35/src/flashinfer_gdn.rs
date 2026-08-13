@@ -29,28 +29,58 @@ pub(crate) enum GdnPrefillBackend {
     FlashInfer,
 }
 
-pub(crate) struct FlashInferGdnChunkResources {
+pub(crate) struct FlashInferGdnBatchResources {
     pub(crate) prepare: GdnPrepareScratch35,
     pub(crate) output: HiddenStates,
+    pub(crate) state: Option<CudaSlice<f32>>,
+    pub(crate) state_elements_per_sequence: usize,
+    pub(crate) num_seqs: usize,
     launch: Qwen35GdnWorkspace,
 }
 
-impl FlashInferGdnChunkResources {
+impl FlashInferGdnBatchResources {
     pub(crate) fn new(
         ctx: &DeviceContext,
         config: &Config35,
         backend: &Qwen35GdnAot,
         tokens: usize,
     ) -> Result<Self> {
+        Self::new_batch(ctx, config, backend, &[tokens])
+    }
+
+    pub(crate) fn new_batch(
+        ctx: &DeviceContext,
+        config: &Config35,
+        backend: &Qwen35GdnAot,
+        sequence_lengths: &[usize],
+    ) -> Result<Self> {
         let geometry = model_geometry(config);
         ensure!(
             geometry == Qwen35GdnGeometry::PRODUCTION,
             "FlashInfer GDN is not supported for model geometry {geometry:?}"
         );
+        let total_tokens = sequence_lengths.iter().try_fold(0usize, |total, &tokens| {
+            anyhow::ensure!(tokens > 0, "FlashInfer GDN sequence has T=0");
+            total
+                .checked_add(tokens)
+                .context("FlashInfer GDN total token extent overflow")
+        })?;
+        let state_elements_per_sequence = geometry.h_v * geometry.head_dim * geometry.head_dim;
         Ok(Self {
-            prepare: GdnPrepareScratch35::new(ctx, config, tokens)?,
-            output: HiddenStates::zeros(ctx, geometry.h_v * geometry.head_dim, tokens)?,
-            launch: backend.allocate_workspace(ctx, tokens)?,
+            prepare: GdnPrepareScratch35::new(ctx, config, total_tokens)?,
+            output: HiddenStates::zeros(ctx, geometry.h_v * geometry.head_dim, total_tokens)?,
+            state: if sequence_lengths.len() > 1 {
+                Some(
+                    ctx.stream
+                        .alloc_zeros(state_elements_per_sequence * sequence_lengths.len())
+                        .map_err(|error| anyhow::anyhow!("allocate batched GDN state: {error}"))?,
+                )
+            } else {
+                None
+            },
+            state_elements_per_sequence,
+            num_seqs: sequence_lengths.len(),
+            launch: backend.allocate_batch_workspace(ctx, sequence_lengths)?,
         })
     }
 
@@ -74,6 +104,28 @@ impl FlashInferGdnChunkResources {
         state: &mut CudaSlice<f32>,
     ) -> Result<()> {
         backend.launch_in_place(
+            ctx,
+            &self.prepare.q,
+            &self.prepare.k,
+            &self.prepare.v,
+            &self.prepare.alpha,
+            &self.prepare.beta,
+            state,
+            &mut self.output,
+            &mut self.launch,
+        )
+    }
+
+    pub(crate) fn launch_staged_batch(
+        &mut self,
+        ctx: &DeviceContext,
+        backend: &Qwen35GdnAot,
+    ) -> Result<()> {
+        let state = self
+            .state
+            .as_mut()
+            .context("batched GDN launch requires staged state")?;
+        backend.launch_batch_in_place(
             ctx,
             &self.prepare.q,
             &self.prepare.k,

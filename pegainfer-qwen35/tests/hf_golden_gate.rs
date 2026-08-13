@@ -894,6 +894,31 @@ fn production_flashinfer_gdn_matches_hf_short_golden() {
         production_before.successful_launches,
         production_after.successful_launches,
     );
+
+    let batch_size = BUCKET_STRADDLES[0];
+    assert!(
+        golden.num_seqs >= batch_size,
+        "FlashInfer ragged HF gate requires at least {batch_size} fixture sequences"
+    );
+    let mut batched_production = build_executor(&model_path);
+    let batched_before = batched_production
+        .flashinfer_gdn_runtime_evidence()
+        .expect("read batched production GDN evidence before HF replay")
+        .expect("batched production dispatch must select FlashInfer");
+    let (batched_stats, _) = run(&golden, &mut batched_production, &all[..batch_size], true);
+    report_and_assert(
+        &format!("production Auto ragged batch={batch_size}"),
+        &batched_stats,
+    );
+    let batched_after = batched_production
+        .flashinfer_gdn_runtime_evidence()
+        .expect("read batched production GDN evidence after HF replay")
+        .expect("batched production dispatch lost FlashInfer identity");
+    assert_eq!(
+        batched_after.successful_launches - batched_before.successful_launches,
+        24,
+        "Qwen3.5-4B ragged prefill must launch one FlashInfer kernel per linear layer, not per request"
+    );
 }
 
 #[test]

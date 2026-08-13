@@ -1,11 +1,12 @@
 //! Qwen3.5 batch prefill and unified step (prefill + decode combined).
 //!
-//! Linear attention (GDR chunkwise) does not have an efficient batched prefill
-//! kernel, so `batch_prefill` runs each request's prefill serially. Full-attention
-//! layers also run per-request to reuse the existing paged prefill path.
+//! The SM120/Hv32 FlashInfer capability uses a layer-major ragged batch for
+//! linear attention. Full-attention layers remain per-request to reuse the
+//! existing paged prefill path. Triton, B=1, and oversized batches keep the
+//! established serial request-major path.
 //!
 //! `unified_step` combines:
-//!   1. Serial `batch_prefill` for new requests entering the batch.
+//!   1. Capability-selected `batch_prefill` for new requests entering the batch.
 //!   2. `batch_decode_graph` for existing decode requests (CUDA Graph for
 //!      compiled GQA groups; eager prefill fallback for uncompiled ones).
 
@@ -14,6 +15,8 @@ use pegainfer_core::kv_pool::KvState;
 use pegainfer_core::tensor::HiddenStates;
 
 use super::batch_decode_graph::BatchDecodeGraphState;
+use super::flashinfer_gdn::GdnPrefillBackend;
+use super::prefill::PREFILL_CHUNK_LEN;
 use super::recurrent_state::RecurrentState;
 use super::weights::Qwen35Model;
 
@@ -23,10 +26,11 @@ pub(crate) struct UnifiedStepOutput {
 }
 
 impl Qwen35Model {
-    /// Prefill `n` prompts sequentially, updating each request's KV and recurrent state.
+    /// Prefill `n` prompts, updating each request's independent KV and recurrent state.
     ///
     /// Returns batched last-token logits `[selection_vocab, n]` in request order.
-    /// Requests are independent — there is no cross-request batching in the prefill pass.
+    /// The supported FlashInfer case may share one ragged execution batch, but
+    /// request identity and state ownership remain independent.
     pub(crate) fn batch_prefill_logits(
         &self,
         prompts: &[&[u32]],
@@ -41,16 +45,30 @@ impl Qwen35Model {
             "prompts / recurrent_states len mismatch"
         );
 
-        let mut last_hiddens = Vec::with_capacity(n);
-        for i in 0..n {
-            let last_hidden =
-                self.prefill_last_hidden(prompts[i], &mut kv_states[i], recurrent_states[i])?;
-            debug_assert_eq!(
-                last_hidden.len, self.config.hidden_size,
-                "Qwen3.5 prefill last hidden row must match request {i}"
-            );
-            last_hiddens.push(last_hidden);
-        }
+        let total_tokens = prompts.iter().try_fold(0usize, |total, prompt| {
+            total
+                .checked_add(prompt.len())
+                .ok_or_else(|| anyhow::anyhow!("batch prefill token extent overflow"))
+        })?;
+        let can_batch_flashinfer = n > 1
+            && self.resolved_gdn_backend() == GdnPrefillBackend::FlashInfer
+            && prompts.iter().all(|prompt| !prompt.is_empty())
+            && total_tokens <= PREFILL_CHUNK_LEN;
+        let last_hiddens = if can_batch_flashinfer {
+            self.prefill_batch_last_hidden_flashinfer(prompts, kv_states, recurrent_states)?
+        } else {
+            let mut last_hiddens = Vec::with_capacity(n);
+            for i in 0..n {
+                let last_hidden =
+                    self.prefill_last_hidden(prompts[i], &mut kv_states[i], recurrent_states[i])?;
+                debug_assert_eq!(
+                    last_hidden.len, self.config.hidden_size,
+                    "Qwen3.5 prefill last hidden row must match request {i}"
+                );
+                last_hiddens.push(last_hidden);
+            }
+            last_hiddens
+        };
         self.batch_last_hidden_logits(&last_hiddens)
     }
 
