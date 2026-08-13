@@ -110,8 +110,8 @@ fn checked_cu_seqlens(sequence_lengths: &[usize]) -> Result<Vec<i64>> {
             .checked_add(tokens)
             .context("Qwen3.5 GDN total token extent overflow")?;
         ensure!(
-            total <= i32::MAX as usize,
-            "Qwen3.5 GDN total token extent exceeds i32"
+            total <= i32::MAX as usize / Qwen35GdnGeometry::PRODUCTION.h_v,
+            "Qwen3.5 GDN token/gate extent exceeds i32"
         );
         offsets.push(total as i64);
     }
@@ -493,6 +493,10 @@ mod tests {
         );
         assert!(checked_cu_seqlens(&[]).is_err());
         assert!(checked_cu_seqlens(&[1, 0, 2]).is_err());
+        assert!(
+            checked_cu_seqlens(&[i32::MAX as usize / Qwen35GdnGeometry::PRODUCTION.h_v + 1])
+                .is_err()
+        );
     }
 
     #[test]

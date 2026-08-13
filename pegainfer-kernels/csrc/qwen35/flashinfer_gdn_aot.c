@@ -136,7 +136,7 @@ int32_t pegainfer_qwen35_gdn_launch(void *handle,
         args->h_q != 16 || args->h_k != 16 || args->h_v != 32 ||
         args->head_dim != 128 || args->num_seqs == 0 ||
         args->num_seqs > (uint32_t)(INT32_MAX / 32) ||
-        args->tokens > (uint32_t)INT32_MAX ||
+        args->tokens > (uint32_t)(INT32_MAX / 32) ||
         args->cu_seqlens_len != args->num_seqs + 1 ||
         args->q == NULL || args->k == NULL || args->v == NULL ||
         args->output == NULL || args->alpha == NULL || args->beta == NULL ||
