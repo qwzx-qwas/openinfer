@@ -895,6 +895,12 @@ fn production_flashinfer_gdn_matches_hf_short_golden() {
         production_after.successful_launches,
     );
 
+    // A Qwen3.5-4B executor owns almost the full 32 GiB device. Release the
+    // sequential replay before constructing the independent ragged-batch
+    // executor, otherwise the gate tests model residency rather than GDN
+    // batching correctness.
+    drop(production);
+
     let batch_size = BUCKET_STRADDLES[0];
     assert!(
         golden.num_seqs >= batch_size,
